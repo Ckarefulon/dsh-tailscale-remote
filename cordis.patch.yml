@@ -1,0 +1,9 @@
+# Standalone bundle layer: one Host-only row that owns the Tailscale Serve
+# route in front of this Harness's own Web server. It is inert unless its
+# `enabled` config is true, and it never touches the Web bundle's rows.
+- insert:
+    - id: dsh-tailscale-remote
+      name: dsh-tailscale-remote
+      config:
+        enabled: true
+        httpsPort: 7259

@@ -1,0 +1,49 @@
+{
+  "name": "dsh-tailscale-remote",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Open DSH and reach its Web GUI from your phone anywhere: brings Tailscale up, serves the GUI on your tailnet at a fixed port, and tears the route down on exit.",
+  "license": "MIT",
+  "author": "Ckarefulon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ckarefulon/dsh-tailscale-remote.git"
+  },
+  "homepage": "https://github.com/Ckarefulon/dsh-tailscale-remote#readme",
+  "bugs": {
+    "url": "https://github.com/Ckarefulon/dsh-tailscale-remote/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "tailscale",
+    "tailnet",
+    "serve",
+    "remote",
+    "mobile",
+    "phone",
+    "remote-access"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/classify.test.mjs test/teardown.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
