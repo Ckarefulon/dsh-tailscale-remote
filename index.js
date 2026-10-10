@@ -23,7 +23,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -392,6 +392,49 @@ async function ensureLoginSecret(scope, config, deps) {
   return randomBytes(24).toString('base64url')
 }
 
+/** DSH 的浏览器会话 cookie 前缀（与 client-connection 的 `COOKIE_PREFIX` 一致）。 */
+const COOKIE_PREFIX = 'dsh-auth-'
+
+/** base64url 编码（与 DSH 内部实现逐字一致：+→-、/→_、去掉尾部 =）。 */
+function base64url(buffer) {
+  return buffer.toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
+}
+
+/**
+ * 直接**铸造** DSH 的浏览器会话 cookie。
+ *
+ * 为什么要自己铸：DSH 正常流程是「带 `?token=` 访问 → 303 + Set-Cookie → 跳回 `/`」。
+ * 这条链在手机浏览器上很脆（跨站跳转 + `SameSite=Strict`：从别的 App 点进来时，
+ * 后续请求可能不带 cookie，于是又看到那句未授权提示）。自己铸就只要一跳：
+ * `/remote/<密钥>` → 302 到 `/` **同时把 cookie 种下去**，而且可以用 `SameSite=Lax`。
+ *
+ * 格式必须和 `client-connection` 完全一致，否则 `isAuthenticated` 验不过：
+ *   cookie 名 = `dsh-auth-` + base64url(sha256(authority))
+ *   值       = `v1.` + base64url(JSON) + `.` + base64url(HMAC-SHA256(secret, base64url(JSON)))
+ *   JSON     = { version: 1, authority, issuedAt, expiresAt }
+ * @returns 铸好的 cookie；拿不到签名密钥时返回 undefined（调用方回落到令牌跳转）。
+ */
+function mintSessionCookie(connection, authority, maxAgeMilliseconds) {
+  const secret = connection?.browserAuth?.secret
+  if (!Buffer.isBuffer(secret) || secret.length === 0) return undefined
+  const issuedAt = Date.now()
+  const expiresAt = issuedAt + maxAgeMilliseconds
+  if (!Number.isSafeInteger(expiresAt)) return undefined
+  const body = base64url(Buffer.from(JSON.stringify({ version: 1, authority, issuedAt, expiresAt }), 'utf8'))
+  const signature = base64url(createHmac('sha256', secret).update(body).digest())
+  return {
+    name: COOKIE_PREFIX + base64url(createHash('sha256').update(authority).digest()),
+    value: `v1.${body}.${signature}`,
+    maxAgeSeconds: Math.floor(maxAgeMilliseconds / 1000),
+    expiresAt,
+  }
+}
+
+/** 把铸好的 cookie 序列化成 `Set-Cookie` 头值。`SameSite=Lax` 是刻意的（见上）。 */
+function sessionCookieHeader(minted) {
+  return `${minted.name}=${minted.value}; Max-Age=${String(minted.maxAgeSeconds)}; Path=/; Expires=${new Date(minted.expiresAt).toUTCString()}; HttpOnly; SameSite=Lax`
+}
+
 /**
  * 插件入口。
  * @param {import('@deepseek-ai/cordis').Context} ctx - 插件上下文。
@@ -587,6 +630,19 @@ async function setup(scope, config, undo, deps = REAL_DEPS) {
                 res.end()
                 return
               }
+              // 首选：自己铸 cookie，一跳到位（见 mintSessionCookie 的说明）。
+              const minted = mintSessionCookie(connection, authority, config.cookieMaxAgeDays * 86400000)
+              if (minted !== undefined) {
+                res.writeHead(302, {
+                  location: `https://${authority}/`,
+                  'set-cookie': sessionCookieHeader(minted),
+                  'cache-control': 'no-store',
+                  'referrer-policy': 'no-referrer',
+                })
+                res.end()
+                return
+              }
+              // 回落：拿不到签名密钥时走 DSH 自己的令牌链。
               res.writeHead(302, {
                 location: handoffUrl,
                 'cache-control': 'no-store',
@@ -713,6 +769,8 @@ export const internals = {
   waitForRunning,
   ensureRunning,
   ensureLoginSecret,
+  mintSessionCookie,
+  sessionCookieHeader,
   setup,
   teardown,
   REAL_DEPS,

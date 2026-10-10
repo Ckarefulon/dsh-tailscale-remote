@@ -1,6 +1,7 @@
 // 退出清理的行为测试：用假的 deps 记录调用，不碰真实的 tailscale。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash, createHmac } from 'node:crypto'
 import { internals } from '../index.js'
 
 const { teardown, setup } = internals
@@ -376,7 +377,7 @@ test('loginRoute=false 时不注册登录入口，也不写 loginSecret', async 
   assert.equal(deps.persisted.at(-1).loginSecret, undefined)
 })
 
-test('登录入口的处理器：GET 302 到带令牌的地址，非 GET 405', async () => {
+test('登录入口的处理器：没有签名密钥时回落到令牌跳转，非 GET 405', async () => {
   const deps = fakeDeps({ ensureLoginSecret: async () => 'SECRET_abcdefghijklmnopqrst' })
   const scope = fakeScope()
   const undo = { trustedHost: undefined, createdRoute: false, startedTailscale: false, binary: undefined }
@@ -394,13 +395,55 @@ test('登录入口的处理器：GET 302 到带令牌的地址，非 GET 405', a
   }
   route.handler({ method: 'GET' }, res)
   assert.equal(seen[0].code, 302)
-  assert.equal(
-    seen[0].headers.location,
-    'https://host.ts.net:7259/?token=abc',
-    '必须跳到带一次性令牌的地址，浏览器才会种下 cookie',
-  )
-  assert.equal(seen[0].headers['cache-control'], 'no-store')
+  assert.equal(seen[0].headers.location, 'https://host.ts.net:7259/?token=abc')
 
   route.handler({ method: 'POST' }, res)
   assert.equal(seen[1].code, 405)
+})
+
+test('能拿到签名密钥时：自己铸 cookie，一跳直达根路径（不再走令牌链）', async () => {
+  const deps = fakeDeps({ ensureLoginSecret: async () => 'SECRET_abcdefghijklmnopqrst' })
+  const scope = fakeScope()
+  scope.store.connection.browserAuth.secret = Buffer.alloc(32, 7)
+  const undo = { trustedHost: undefined, createdRoute: false, startedTailscale: false, binary: undefined }
+
+  await setup(scope, CONFIG, undo, deps)
+
+  const route = scope.routes.find((r) => r.path === '/remote/SECRET_abcdefghijklmnopqrst')
+  const seen = []
+  route.handler({ method: 'GET' }, { writeHead: (c, h) => seen.push({ c, h }), end: () => {} })
+
+  assert.equal(seen[0].c, 302)
+  assert.equal(seen[0].h.location, 'https://host.ts.net:7259/', '直接跳根路径，不再经过 ?token=')
+  const cookie = seen[0].h['set-cookie']
+  assert.ok(cookie.startsWith('dsh-auth-'), 'cookie 名必须是 DSH 的前缀，否则 isAuthenticated 找不到')
+  assert.match(cookie, /; HttpOnly/)
+  assert.match(cookie, /SameSite=Lax/, 'Lax 而不是 Strict —— 从别的 App 点进来时也要带上 cookie')
+  assert.match(cookie, /Path=\//)
+})
+
+test('铸出来的 cookie 与 client-connection 的 encodeCookie 同构', async () => {
+  const secret = Buffer.alloc(32, 9)
+  const authority = 'host.ts.net:7259'
+  const minted = internals.mintSessionCookie({ browserAuth: { secret } }, authority, 3650 * 86400000)
+
+  const b64url = (b) => b.toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
+  assert.equal(minted.name, `dsh-auth-${b64url(createHash('sha256').update(authority).digest())}`)
+
+  const parts = minted.value.split('.')
+  assert.equal(parts.length, 3)
+  assert.equal(parts[0], 'v1')
+  assert.equal(parts[2], b64url(createHmac('sha256', secret).update(parts[1]).digest()), '签名必须对得上')
+
+  const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
+  assert.equal(payload.version, 1)
+  assert.equal(payload.authority, authority, 'authority 必须与请求的 Host 一致')
+  assert.ok(payload.expiresAt > payload.issuedAt)
+  assert.ok(payload.expiresAt - payload.issuedAt <= 3650 * 86400000, 'DSH 会校验这个上限')
+})
+
+test('拿不到签名密钥时不铸 cookie（回落到令牌链，不抛）', () => {
+  assert.equal(internals.mintSessionCookie({ browserAuth: {} }, 'h:1', 1000), undefined)
+  assert.equal(internals.mintSessionCookie(undefined, 'h:1', 1000), undefined)
+  assert.equal(internals.mintSessionCookie({ browserAuth: { secret: 'not-a-buffer' } }, 'h:1', 1000), undefined)
 })
