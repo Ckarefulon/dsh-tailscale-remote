@@ -46,11 +46,57 @@ dsh plugin --profile <profile> add -w /path/to/dsh-tailscale-remote
 插件在运行时把该 authority 推进 `connection.trustedHosts`（这是个可变数组，fence 每次
 请求都读它），所以不需要改 profile 的 `cordis.yml`。
 
-## 手机上怎么用
+## 手机上怎么用（重点：怎么拿到登录链接）
 
-第一次用打印出来的**带令牌链接**打开（`?token=...`），它会种下 30 天的 HttpOnly cookie；
-之后直接用不带令牌的干净地址即可，可以加到主屏幕当 App 用。令牌是**进程级**的，每次
-重启 DSH 都会变；新链接在日志里、也会写进 `$DSH_HOME/tailscale-remote.json`。
+DSH 的 Web GUI 默认要求一次**登录令牌**才让你进去，没有令牌就只显示一句话：
+
+```
+dsh web authentication required; reopen the URL printed by dsh web.
+```
+
+麻烦的地方在于：**DSH Desktop 从不打印这行链接**（它走 IPC，不走 `dsh web`），而令牌又是
+**进程级**的、每次重启都换。所以本插件做了两件事，让你**只需要拿一次链接**：
+
+### ① 稳定登录入口（推荐，存一次书签就够）
+
+插件会在 DSH 自己的 webserver 上注册一条路由：
+
+```
+https://<你的机器>.<tailnet>.ts.net:7259/remote/<持久密钥>
+```
+
+打开它就会 **302 跳转**到带令牌的地址、种下 cookie，然后你就进 GUI 了。
+
+这条链接的密钥存在状态文件里，**跨重启不变** —— 所以手机上存一次书签，以后点一下就进。
+
+> 密钥本身就是访问门槛：不知道它的人拿不到会话（和 DSH 自己的令牌同一级别）。
+> 不需要的话可以设 `loginRoute: false` 关掉。
+
+### ② 状态文件（永远可以查到）
+
+任何一次启动后，下面这个文件里都有**当前**可用的链接：
+
+```sh
+# 三个字段：loginUrl（稳定入口）、url（一次性令牌链接）、plainUrl（干净地址）
+cat ~/.dsh/tailscale-remote.json
+```
+
+Windows PowerShell：
+
+```powershell
+Get-Content "$env:USERPROFILE\.dsh\tailscale-remote.json"
+```
+
+拿 `loginUrl` 那个值，在手机上打开即可。它同时也会打到 DSH 的日志里。
+
+### 登录之后
+
+cookie 种下后，直接访问干净地址 `https://<机器>.<tailnet>.ts.net:7259/` 就能进，
+可以「添加到主屏幕」当 App 用。
+
+**cookie 有效期默认 10 年**（见下面的 `cookieMaxAgeDays`）—— DSH 原版是 30 天，对
+「手机随时连」太短，插件启动时会把 `connection` 上那个活的 `maxAgeMilliseconds`
+直接改长。所以正常情况下你**只需要登录一次**。
 
 > 注意：DSH 0.2.0-rc.2 的 Web 前端**没有响应式布局**（JS 无 `matchMedia`，CSS 里只有
 > `prefers-reduced-motion`，没有宽度断点），所以在手机上打开是桌面三栏挤在一起 ——
@@ -72,11 +118,22 @@ dsh plugin --profile <profile> add -w /path/to/dsh-tailscale-remote
 | `serveOnStart` | `true` | 是否建立 Serve 路由。 |
 | `teardownOnExit` | `true` | 退出时是否回滚。 |
 | `trustedHosts` | `true` | 是否把该 authority 加进 `/api` 信任列表。 |
+| `loginRoute` | `true` | 是否注册 `/remote/<持久密钥>` 这个稳定登录入口。 |
+| `cookieMaxAgeDays` | `3650` | 登录 cookie 有效期（天）。`0` = 不插手 DSH 的 30 天默认值。 |
 | `binaryPath` | 自动探测 | `tailscale` CLI 可执行文件路径。 |
 | `guiPath` | 自动探测 | Tailscale **桌面客户端**路径（Windows 默认 `tailscale-ipn.exe`）。 |
 | `readyTimeoutMs` | `8000` | 等 `tailscale up` 生效的预算。 |
 | `guiReadyTimeoutMs` | `25000` | 启动桌面客户端后等 backend 就绪的预算。 |
 | `stateFile` | `$DSH_HOME/tailscale-remote.json` | 状态文件位置。 |
+
+### 关于「永久不过期」
+
+DSH 把 cookie 有效期上限写死在 `connection` 的 `cookieMaxAgeDays` 里，并且校验时要求
+`expiresAt - issuedAt <= maxAgeMilliseconds` —— 所以**自己造一个超长 cookie 是无效的**，
+必须改这个上限。本插件启动时会直接改 `connection.browserAuth.maxAgeMilliseconds`，
+默认给 10 年（`3650` 天），够用且不会溢出 JS 安全整数范围。
+
+想更长就把它调大（比如 `36500` = 100 年）；`0` 表示完全不动 DSH 的默认 30 天。
 
 ## 为什么不能只调 `tailscale up`
 

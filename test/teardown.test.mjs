@@ -28,6 +28,9 @@ function fakeDeps(overrides = {}) {
     // 默认：假装桌面客户端启动成功（真实实现启动的是常驻托盘程序）。
     launchGui: async () => true,
     resolveGui: () => 'C:\\fake\\tailscale-ipn.exe',
+    // 默认没有历史状态 → 每次生成新密钥；个别用例覆盖它来验证「跨重启复用」。
+    loadState: async () => undefined,
+    ensureLoginSecret: async () => 'test-secret-0123456789abcdef',
     ...overrides,
   }
   return deps
@@ -36,12 +39,26 @@ function fakeDeps(overrides = {}) {
 /** 造一个最小的 scope。 */
 function fakeScope({ port = 19387, trusted = [] } = {}) {
   const logs = []
+  const routes = []
   const store = {
     webServer: { port },
-    connection: { trustedHosts: trusted, authenticatedUrl: (u) => `${u}?token=abc` },
+    connection: {
+      trustedHosts: trusted,
+      authenticatedUrl: (u) => `${u}?token=abc`,
+      // 真实的 connection 上有这个活的 BrowserAuth 实例；插件会改它的 maxAgeMilliseconds。
+      browserAuth: { maxAgeMilliseconds: 30 * 86400000 },
+    },
+  }
+  // 插件用嵌套 inject 去拿 webServer 注册登录入口；这里给一个能记录路由的替身。
+  const fakeWebServer = {
+    register: (route) => {
+      routes.push(route)
+      return () => {}
+    },
   }
   return {
     logs,
+    routes,
     store,
     logger: {
       info: (m) => logs.push(`info:${m}`),
@@ -49,6 +66,11 @@ function fakeScope({ port = 19387, trusted = [] } = {}) {
       error: (m) => logs.push(`error:${m}`),
     },
     get: (name) => store[name],
+    inject: (_deps, callback) =>
+      callback({
+        get: (name) => (name === 'webServer' ? fakeWebServer : undefined),
+        effect: (fn) => fn(),
+      }),
   }
 }
 
@@ -61,6 +83,8 @@ const CONFIG = {
   trustedHosts: true,
   readyTimeoutMs: 0,
   guiReadyTimeoutMs: 0,
+  cookieMaxAgeDays: 0,
+  loginRoute: true,
 }
 
 test('本来就在运行的 tailscale：退出时只撤路由，不 down', async () => {
@@ -281,4 +305,102 @@ test('拿不到 Web 端口：不建路由', async () => {
 
   assert.equal(undo.createdRoute, false)
   assert.equal(undo.trustedHost, undefined)
+})
+
+test('把 connection 上的 cookie 有效期改成配置的天数（不是干等 30 天）', async () => {
+  const deps = fakeDeps()
+  const scope = fakeScope()
+  const undo = { trustedHost: undefined, createdRoute: false, startedTailscale: false, binary: undefined }
+
+  await setup(scope, { ...CONFIG, cookieMaxAgeDays: 3650 }, undo, deps)
+
+  assert.equal(
+    scope.store.connection.browserAuth.maxAgeMilliseconds,
+    3650 * 86400000,
+    '必须直接改那个活的 maxAgeMilliseconds，否则种下的 cookie 还是 30 天',
+  )
+})
+
+test('cookieMaxAgeDays=0 表示不插手 DSH 的默认值', async () => {
+  const deps = fakeDeps()
+  const scope = fakeScope()
+  const undo = { trustedHost: undefined, createdRoute: false, startedTailscale: false, binary: undefined }
+
+  await setup(scope, { ...CONFIG, cookieMaxAgeDays: 0 }, undo, deps)
+
+  assert.equal(scope.store.connection.browserAuth.maxAgeMilliseconds, 30 * 86400000, '保持原样')
+})
+
+test('登录入口用持久密钥，并且落进状态文件（跨重启不变）', async () => {
+  const deps = fakeDeps({ ensureLoginSecret: async () => 'STABLE_SECRET_abcdefghijklmnop' })
+  const scope = fakeScope()
+  const undo = { trustedHost: undefined, createdRoute: false, startedTailscale: false, binary: undefined }
+
+  await setup(scope, CONFIG, undo, deps)
+
+  assert.equal(undo.loginPath, '/remote/STABLE_SECRET_abcdefghijklmnop')
+  const state = deps.persisted.at(-1)
+  assert.equal(state.loginUrl, 'https://host.ts.net:7259/remote/STABLE_SECRET_abcdefghijklmnop')
+  assert.equal(state.loginSecret, 'STABLE_SECRET_abcdefghijklmnop', '密钥要落盘，下次才能复用')
+})
+
+test('密钥从历史状态文件复用；没有才新生成', async () => {
+  const { ensureLoginSecret } = internals
+  const reused = await ensureLoginSecret(fakeScope(), CONFIG, {
+    loadState: async () => ({ loginSecret: 'KEEP_THIS_0123456789abcdefgh' }),
+  })
+  assert.equal(reused, 'KEEP_THIS_0123456789abcdefgh', '已有密钥必须复用，否则手机上的书签会失效')
+
+  const fresh = await ensureLoginSecret(fakeScope(), CONFIG, { loadState: async () => undefined })
+  assert.match(fresh, /^[A-Za-z0-9_-]{22,}$/, '没有历史时生成足够长的随机密钥')
+  assert.notEqual(fresh, reused)
+})
+
+test('历史状态文件损坏/密钥形状不对时，重新生成而不是沿用', async () => {
+  const { ensureLoginSecret } = internals
+  const bad = await ensureLoginSecret(fakeScope(), CONFIG, {
+    loadState: async () => ({ loginSecret: 'short' }),
+  })
+  assert.match(bad, /^[A-Za-z0-9_-]{22,}$/)
+  assert.notEqual(bad, 'short')
+})
+
+test('loginRoute=false 时不注册登录入口，也不写 loginSecret', async () => {
+  const deps = fakeDeps()
+  const scope = fakeScope()
+  const undo = { trustedHost: undefined, createdRoute: false, startedTailscale: false, binary: undefined }
+
+  await setup(scope, { ...CONFIG, loginRoute: false }, undo, deps)
+
+  assert.equal(undo.loginPath, undefined)
+  assert.equal(deps.persisted.at(-1).loginSecret, undefined)
+})
+
+test('登录入口的处理器：GET 302 到带令牌的地址，非 GET 405', async () => {
+  const deps = fakeDeps({ ensureLoginSecret: async () => 'SECRET_abcdefghijklmnopqrst' })
+  const scope = fakeScope()
+  const undo = { trustedHost: undefined, createdRoute: false, startedTailscale: false, binary: undefined }
+
+  await setup(scope, CONFIG, undo, deps)
+
+  const route = scope.routes.find((r) => r.path === '/remote/SECRET_abcdefghijklmnopqrst')
+  assert.ok(route !== undefined, '必须注册这条 exact 路由')
+  assert.equal(route.kind, 'exact', 'exact 才能盖过 SPA 的 fallback')
+
+  const seen = []
+  const res = {
+    writeHead: (code, headers) => seen.push({ code, headers }),
+    end: () => {},
+  }
+  route.handler({ method: 'GET' }, res)
+  assert.equal(seen[0].code, 302)
+  assert.equal(
+    seen[0].headers.location,
+    'https://host.ts.net:7259/?token=abc',
+    '必须跳到带一次性令牌的地址，浏览器才会种下 cookie',
+  )
+  assert.equal(seen[0].headers['cache-control'], 'no-store')
+
+  route.handler({ method: 'POST' }, res)
+  assert.equal(seen[1].code, 405)
 })
