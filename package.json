@@ -2,7 +2,7 @@
   "name": "dsh-tailscale-remote",
   "version": "0.1.0",
   "type": "module",
-  "description": "Open DSH and reach its Web GUI from your phone anywhere: brings Tailscale up, serves the GUI on your tailnet at a fixed port, and tears the route down on exit.",
+  "description": "Publishes the DSH Web GUI on your tailnet whenever DSH runs, so a phone anywhere can connect, and removes the route on exit. The login link lives in the loginUrl field of ~/.dsh/tailscale-remote.json (https://<machine>.<tailnet>.ts.net:7259/remote/<key>); bookmark it once — it survives restarts.",
   "license": "MIT",
   "author": "Ckarefulon",
   "repository": {
@@ -27,7 +27,8 @@
   ],
   "exports": {
     ".": "./index.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "dsh": {
     "bundle": {
@@ -38,7 +39,8 @@
     "index.js",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "locale/*.json"
   ],
   "scripts": {
     "test": "node --test test/classify.test.mjs test/teardown.test.mjs"

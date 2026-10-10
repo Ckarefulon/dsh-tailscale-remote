@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tailscale remote access",
+    "description": "Publishes the DSH Web GUI on your tailnet whenever DSH runs, so a phone anywhere can connect, and removes the route on exit. Your login link lives in the loginUrl field of ~/.dsh/tailscale-remote.json (https://<machine>.<tailnet>.ts.net:7259/remote/<key>); bookmark it once on the phone — it survives restarts."
+  }
+}

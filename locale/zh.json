@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tailscale 远程访问",
+    "description": "开 DSH 就把 Web GUI 发布到你的 tailnet，手机随处可连；关 DSH 自动撤掉路由。登录链接在 ~/.dsh/tailscale-remote.json 的 loginUrl 字段（形如 https://<机器>.<tailnet>.ts.net:7259/remote/<密钥>），手机上存一次书签即可，跨重启不变。"
+  }
+}

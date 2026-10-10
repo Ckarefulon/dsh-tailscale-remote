@@ -6,6 +6,34 @@
 > 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）用的插件。
 > 只需要「随时随地用手机连上自己电脑上的 DSH」这一件事，不引入任何第三方中转。
 
+## 先看这个：手机怎么进
+
+DSH 的 Web GUI 要求一次**登录令牌**，没令牌只显示一句
+`dsh web authentication required; ...`。DSH Desktop 又**从不打印**那行链接，令牌还每次重启都换 ——
+所以插件给你一条**存一次就永久用**的入口：
+
+```sh
+# 装好并重启 DSH 后，执行（Windows 用 PowerShell 见下）
+cat ~/.dsh/tailscale-remote.json
+```
+
+读里面 **`loginUrl`** 那个值，形如：
+
+```
+https://<你的机器>.<tailnet>.ts.net:7259/remote/<持久密钥>
+```
+
+**在手机浏览器打开它一次**（会自动跳转并登录），然后**存成书签/主屏幕图标** ——
+这条链接跨重启不变，以后点一下就进。
+
+Windows PowerShell 读法：
+
+```powershell
+Get-Content "$env:USERPROFILE\.dsh\tailscale-remote.json"
+```
+
+就这么两步：**读 `loginUrl` → 手机打开一次并存书签**。下面都是细节。
+
 ## 安装
 
 ```sh
@@ -98,9 +126,10 @@ cookie 种下后，直接访问干净地址 `https://<机器>.<tailnet>.ts.net:7
 「手机随时连」太短，插件启动时会把 `connection` 上那个活的 `maxAgeMilliseconds`
 直接改长。所以正常情况下你**只需要登录一次**。
 
-> 注意：DSH 0.2.0-rc.2 的 Web 前端**没有响应式布局**（JS 无 `matchMedia`，CSS 里只有
-> `prefers-reduced-motion`，没有宽度断点），所以在手机上打开是桌面三栏挤在一起 ——
-> 能操作，但不精致。想要手机专属界面需要自己写客户端插件。
+> 手机上好不好用：**实测可用**。DSH 0.2.0-rc.2 的 Web 前端确实**没有专门的移动端外壳**
+> （JS 无 `matchMedia`，CSS 里只有 `prefers-reduced-motion`、没有宽度断点），但它的三栏是
+> 弹性布局，在手机宽度下会自然收窄，日常查看会话、发消息、看结果都没问题，不会挤成一条。
+> 想要更像 App 的体验（抽屉侧栏、底部导航）需要另外写客户端插件。
 
 ## 前置条件
 
