@@ -1,0 +1,48 @@
+# Publish dsh-tailscale-remote to npm.
+#
+# Authentication is npm **Trusted Publishing** (OIDC): there is no NPM_TOKEN
+# secret anywhere. GitHub mints a short-lived OIDC token for this job, and npm
+# exchanges it for a publish token scoped to this one package. `id-token: write`
+# is what makes that mint possible; without it npm silently falls back to
+# "no credentials" and the publish fails with ENEEDAUTH.
+#
+# The registry is NOT passed via actions/setup-node's `registry-url`. That input
+# writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into ~/.npmrc, and
+# with no NODE_AUTH_TOKEN defined the placeholder survives as a literal string
+# that npm would send as the token. package.json's `publishConfig.registry`
+# already names the registry, so npm resolves it without any .npmrc at all.
+#
+# One-time setup, done once per package on npmjs.com (Settings -> Trusted
+# Publisher): repository Ckarefulon/dsh-tailscale-remote, workflow
+# `publish.yml`, environment blank. The package must already exist on the
+# registry before a trusted publisher can be attached, so the very first
+# release is published by hand; every later one goes through this workflow.
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test
+        run: npm test
+
+      # Refuses to republish an existing version, so a re-run after a partial
+      # failure cannot clobber what is already on the registry.
+      - name: Publish to npm
+        run: npm publish

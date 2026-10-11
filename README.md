@@ -37,7 +37,7 @@ Get-Content "$env:USERPROFILE\.dsh\tailscale-remote.json"
 ## 安装
 
 ```sh
-dsh plugin --profile <你的 profile> add github:Ckarefulon/dsh-tailscale-remote
+dsh plugin --profile <你的 profile> add dsh-tailscale-remote
 ```
 
 装完**重启 DSH**（新包需要重启才会加载）。之后每次开 DSH 它都会自己跑起来。

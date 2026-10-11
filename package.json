@@ -5,6 +5,10 @@
   "description": "Publishes the DSH Web GUI on your tailnet whenever DSH runs, so a phone anywhere can connect, and removes the route on exit. The login link lives in the loginUrl field of ~/.dsh/tailscale-remote.json (https://<machine>.<tailnet>.ts.net:7259/remote/<key>); bookmark it once — it survives restarts.",
   "license": "MIT",
   "author": "Ckarefulon",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Ckarefulon/dsh-tailscale-remote.git"
