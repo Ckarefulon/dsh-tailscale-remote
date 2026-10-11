@@ -185,24 +185,28 @@ DSH 把 cookie 有效期上限写死在 `connection` 的 `cookieMaxAgeDays` 里�
 （`access: public` + `registry: https://registry.npmjs.org/`），所以**直接 `npm publish`
 不带任何参数**就会发到正确的地方——即使本机 `~/.npmrc` 指向的是镜像站。
 
-后续版本走 `.github/workflows/publish.yml`，用 npm **Trusted Publishing（OIDC）** 认证：
-GitHub 给这个 job 签一个短时 token，npm 拿它换一个只对这一个包有效的发布 token。
-**仓库里没有任何 `NPM_TOKEN` secret。** 工作流刻意**不用** `actions/setup-node` 的
-`registry-url` 输入——它会往 `~/.npmrc` 写
+后续版本**自动发布**：推送到 `main` 时 `.github/workflows/publish.yml` 会先跑测试再
+`npm publish`——但**只有 `package.json` 里的 `version` 是 registry 上还没有的版本时才发**。
+所以发版流程就是两步：
+
+1. 改 `package.json` 的 `version`。
+2. 推送到 `main`。
+
+这次运行要么发出这个版本，要么报告「该版本已在线上」并以成功结束。
+**没改版本号的推送是 no-op，不是失败**——所以每个要发出去的改动都必须自己带一次版本号
+变更；只改文档的提交同样会触发工作流，同样 no-op。
+
+认证用 npm **Trusted Publishing（OIDC）**：GitHub 给这个 job 签一个短时 token，npm 拿它换
+一个只对这一个包有效的发布 token。**仓库里没有任何 `NPM_TOKEN` secret。** 工作流刻意
+**不用** `actions/setup-node` 的 `registry-url` 输入——它会往 `~/.npmrc` 写
 `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`，而该变量没定义时这个占位符会
 原样留下、被 npm 当作 token 发出去。registry 交给 `publishConfig` 就够了。
-
-发版步骤：
-
-1. 改 `package.json` 的 `version`，提交。
-2. 为那个 commit 创建 GitHub Release。工作流会先跑测试再 `npm publish`；npm 自身拒绝
-   重发已存在的版本，所以重跑不会覆盖线上内容。
 
 <details>
 <summary>一次性配置：绑定 Trusted Publisher</summary>
 
-Trusted Publisher **只能绑到 registry 上已存在的包**，所以**首次发布必须手工**
-（在检出目录里跑一次 `npm publish`），之后才轮到工作流接管。在 npmjs.com 上：
+Trusted Publisher **只能绑到 registry 上已存在的包**，所以**首次发布是手工做的**
+（在检出目录里跑了一次 `npm publish`），从第二个版本起才轮到工作流接管。在 npmjs.com 上：
 包 → Settings → Trusted Publisher → GitHub Actions，填
 
 | 字段 | 值 |
@@ -210,6 +214,8 @@ Trusted Publisher **只能绑到 registry 上已存在的包**，所以**首次�
 | Repository | `Ckarefulon/dsh-tailscale-remote` |
 | Workflow filename | `publish.yml` |
 | Environment | *留空* |
+
+文件名必须**逐字一致**——npm 把授权绑在它上面，写错会表现为发布报 `ENEEDAUTH`。
 
 </details>
 

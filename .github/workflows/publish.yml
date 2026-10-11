@@ -1,4 +1,12 @@
-# Publish dsh-tailscale-remote to npm.
+# Publish dsh-tailscale-remote to npm, automatically.
+#
+# Push to main and the package goes out — but only when package.json's
+# `version` is one the registry does not already have. That gate is the whole
+# design: bump the version to release a change, leave it alone and the run is a
+# no-op. It also makes the workflow safe to re-run and safe on pushes that only
+# touch docs, and it is what keeps "every change bumps the version" honest —
+# forget the bump and nothing ships, which is visible, rather than a version
+# silently being skipped.
 #
 # Authentication is npm **Trusted Publishing** (OIDC): there is no NPM_TOKEN
 # secret anywhere. GitHub mints a short-lived OIDC token for this job, and npm
@@ -12,17 +20,22 @@
 # that npm would send as the token. package.json's `publishConfig.registry`
 # already names the registry, so npm resolves it without any .npmrc at all.
 #
-# One-time setup, done once per package on npmjs.com (Settings -> Trusted
-# Publisher): repository Ckarefulon/dsh-tailscale-remote, workflow
-# `publish.yml`, environment blank. The package must already exist on the
-# registry before a trusted publisher can be attached, so the very first
-# release is published by hand; every later one goes through this workflow.
+# Requires a one-time setup on npmjs.com, once per package (Settings -> Trusted
+# Publisher): repository Ckarefulon/dsh-tailscale-remote, workflow `publish.yml`,
+# environment blank. The workflow filename must match exactly, because npm ties
+# the grant to it.
 name: Publish
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
   workflow_dispatch:
+
+# Serialize runs so two pushes cannot race the same version. Queued, not
+# cancelled: an in-flight publish must be allowed to finish.
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -42,7 +55,19 @@ jobs:
       - name: Test
         run: npm test
 
-      # Refuses to republish an existing version, so a re-run after a partial
-      # failure cannot clobber what is already on the registry.
-      - name: Publish to npm
-        run: npm publish
+      # `npm view <name>@<version>` exits non-zero when the version is absent,
+      # which is exactly the "not released yet" case. npm publish would refuse a
+      # duplicate anyway; this gate turns that hard failure into a quiet skip so
+      # an unrelated push does not show up as a red run.
+      - name: Publish unless this version is already on the registry
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "::notice::${name}@${version} is already published - nothing to do."
+            echo "Bump \"version\" in package.json to release a change."
+            exit 0
+          fi
+          echo "::notice::publishing ${name}@${version}"
+          npm publish
