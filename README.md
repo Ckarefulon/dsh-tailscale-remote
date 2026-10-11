@@ -179,6 +179,40 @@ DSH 把 cookie 有效期上限写死在 `connection` 的 `cookieMaxAgeDays` 里�
 如果连客户端都拉不起来（例如需要交互式登录），插件会留下明确提示让你手动打开 Tailscale，
 并且**不会**谎报成功去配一条连不上的路由。
 
+## 发布（维护者）
+
+包名 `dsh-tailscale-remote` 已发布到 npm。`package.json` 里写了 `publishConfig`
+（`access: public` + `registry: https://registry.npmjs.org/`），所以**直接 `npm publish`
+不带任何参数**就会发到正确的地方——即使本机 `~/.npmrc` 指向的是镜像站。
+
+后续版本走 `.github/workflows/publish.yml`，用 npm **Trusted Publishing（OIDC）** 认证：
+GitHub 给这个 job 签一个短时 token，npm 拿它换一个只对这一个包有效的发布 token。
+**仓库里没有任何 `NPM_TOKEN` secret。** 工作流刻意**不用** `actions/setup-node` 的
+`registry-url` 输入——它会往 `~/.npmrc` 写
+`//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`，而该变量没定义时这个占位符会
+原样留下、被 npm 当作 token 发出去。registry 交给 `publishConfig` 就够了。
+
+发版步骤：
+
+1. 改 `package.json` 的 `version`，提交。
+2. 为那个 commit 创建 GitHub Release。工作流会先跑测试再 `npm publish`；npm 自身拒绝
+   重发已存在的版本，所以重跑不会覆盖线上内容。
+
+<details>
+<summary>一次性配置：绑定 Trusted Publisher</summary>
+
+Trusted Publisher **只能绑到 registry 上已存在的包**，所以**首次发布必须手工**
+（在检出目录里跑一次 `npm publish`），之后才轮到工作流接管。在 npmjs.com 上：
+包 → Settings → Trusted Publisher → GitHub Actions，填
+
+| 字段 | 值 |
+|---|---|
+| Repository | `Ckarefulon/dsh-tailscale-remote` |
+| Workflow filename | `publish.yml` |
+| Environment | *留空* |
+
+</details>
+
 ## 安全边界
 
 这条路由**只对你的 tailnet 可见**（Tailscale Serve 的默认范围，不是 Funnel），也就是说
