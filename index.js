@@ -107,6 +107,12 @@ function normalizeConfig(raw) {
       Number.isFinite(source.cookieMaxAgeDays) && source.cookieMaxAgeDays >= 0 ? source.cookieMaxAgeDays : 3650,
     // 是否注册一个「稳定登录入口」路由（/remote/<持久密钥>），让手机不用去翻令牌。
     loginRoute: source.loginRoute !== false,
+    // 换密钥时是否**同时吊销所有已登录的会话**。
+    //
+    // 默认 true，因为换密钥的动机通常就是「密钥泄露了」：只换登录密钥的话，
+    // 已经用泄露密钥登录过的人手里那张 10 年 cookie 依然有效。代价是所有设备
+    // （含自己的手机）都要重新登录一次；点按钮的那台会被补发 cookie、不掉线。
+    revokeSessionsOnRotate: source.revokeSessionsOnRotate !== false,
   }
 }
 
@@ -447,6 +453,74 @@ const STATE_PATH = '/api/dsh-tailscale-remote/state'
 const ROTATE_PATH = '/api/dsh-tailscale-remote/rotate'
 
 /**
+ * DSH 浏览器会话 cookie 的签名密钥在 credentials 里的记录键。
+ *
+ * 值是 `credentialKey('client-connection', 'browser-session')` —— 那个 helper 只是
+ * `brandString(`${scope}/${id}`)`（`@deepseek-ai/dsh-credentials` 的 types），所以
+ * 运行时就是这条普通字符串。**必须逐字一致**：写错键会静默写到另一条记录上，
+ * 于是重启后旧密钥照旧生效、旧 cookie 继续能用 —— 换了个寂寞而且毫无提示。
+ */
+const AUTH_RECORD_KEY = 'client-connection/browser-session'
+/** 会话密钥长度（字节），与 client-connection 的 `SECRET_BYTES` 一致，否则它拒绝加载。 */
+const SESSION_SECRET_BYTES = 32
+/** 记录格式版本，与 `STORED_SECRET_VERSION` 一致。 */
+const STORED_SECRET_VERSION = 1
+
+/** 从请求头取规范化的 authority（cookie 名与签名受众都用它）。 */
+function hostAuthority(headers) {
+  const host = headers?.get?.('host')
+  if (typeof host !== 'string' || host === '') return undefined
+  try {
+    return new URL(`http://${host}`).host
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 换掉 DSH 浏览器会话 cookie 的签名密钥，从而**立刻吊销所有已登录的会话**。
+ *
+ * 为什么换密钥必须连这一步一起做：登录链接（`/remote/<密钥>`）只负责**换取**一张
+ * 会话 cookie。密钥泄露后，如果对方已经用它登录过，他手里那张 cookie 是用
+ * `browserAuth.secret` 签名的、**有效期 10 年**，换登录密钥完全不影响它。
+ * 要让泄露的密钥真正失效，签名密钥也得换。
+ *
+ * 两处都要改，缺一不可：
+ *  1. credentials 记录（**持久**）—— 否则 DSH 一重启就把旧密钥读回来，旧 cookie 复活。
+ *  2. 活着的 `browserAuth.secret`（**立即生效**）—— 它按引用比较签名，改了就当场失效。
+ * @param scope - 带 `connection` / `credentials` 的上下文。
+ * @returns 新的密钥字节。
+ * @throws 服务缺席、或写入没有真正落到那条记录上时（绝不假装成功）。
+ */
+async function rotateSessionSecret(scope) {
+  const credentials = scope.get('credentials', false)
+  if (credentials === undefined || typeof credentials.modifyRecord !== 'function') {
+    throw new Error('读不到 credentials 服务，无法吊销已登录的会话')
+  }
+  const connection = scope.get('connection', false)
+  if (connection?.browserAuth === undefined) {
+    throw new Error('读不到 connection.browserAuth，无法吊销已登录的会话')
+  }
+
+  const secret = randomBytes(SESSION_SECRET_BYTES).toString('base64url')
+  const written = await credentials.modifyRecord(AUTH_RECORD_KEY, () =>
+    Promise.resolve({
+      kind: 'grant',
+      payload: { version: STORED_SECRET_VERSION, secret },
+    }),
+  )
+
+  // 回读确认。写错键、或被只读来源遮蔽时，`modifyRecord` 会**成功返回**但记录没变，
+  // 于是这里不校验的话就是「报成功、实则没换」——重启后旧 cookie 复活。
+  if (written?.payload?.secret !== secret) {
+    throw new Error('会话密钥没有写入成功（credentials 记录未更新）')
+  }
+
+  connection.browserAuth.secret = Buffer.from(secret, 'base64url')
+  return connection.browserAuth.secret
+}
+
+/**
  * 组装管理端点要返回的状态。
  *
  * 刻意**不抛**：「还在启动」「起不来」都是设置页要看的正常答案，不是错误响应。
@@ -462,6 +536,8 @@ function statePayload(config, runtime) {
     error: runtime.error ?? null,
     // 只有「已就绪」才谈得上换密钥：换密钥要写回状态文件并重建登录路由。
     canRotate: config.enabled && config.loginRoute && runtime.phase === 'ready',
+    // 换密钥会不会把所有设备踢下线（客户端据此决定警告文案的强度）。
+    revokesSessions: config.enabled && config.loginRoute && config.revokeSessionsOnRotate,
     plainUrl: state?.plainUrl ?? null,
     loginUrl: state?.loginUrl ?? null,
     authority: state?.authority ?? null,
@@ -534,23 +610,33 @@ function installLoginRoute(runtime, connection, config, authority, secret) {
 }
 
 /**
- * 换一个新密钥：装上新路由 → 写回状态文件 → 更新活状态。
+ * 换一个新密钥：换登录密钥 → 吊销所有会话 → 装上新路由 → 写回状态文件 → 更新活状态。
  *
- * 已经登录过的手机**不受影响**：DSH 的会话 cookie 由 `browserAuth.secret` 签名，
- * 和这个登录密钥无关，换密钥只让「拿旧链接重新登录」失效。
+ * 吊销会话是**有意的**：登录密钥泄露后，对方可能已经用它换到一张 10 年有效的会话
+ * cookie；只换登录密钥的话他照样在里面。代价是**所有设备都要重新登录一次**，
+ * 包括你自己的手机 —— 这正是「密钥泄露」时该有的行为。
+ *
+ * 例外：**发起这次更换的那个浏览器会被补发一张新 cookie**，所以它自己不会掉线。
+ * 也就是说「在你电脑上点更换」= 电脑留着、其它设备全部踢掉。
  * @param scope - 带 `connection` 的上下文。
  * @param config - 归一化后的配置。
  * @param runtime - 活状态。
  * @param deps - 依赖注入（测试替换用）。
- * @returns `{ loginUrl, loginPath, updatedAt }`。
- * @throws 未就绪 / 登录入口已关闭 / webServer 不可用时。
+ * @param requestingAuthority - 发起请求的那个 authority（用它给当前浏览器补发 cookie）。
+ * @returns `{ loginUrl, loginPath, updatedAt, revokesSessions, stayedSignedIn }`。
+ * @throws 未就绪 / 登录入口已关闭 / webServer 或 credentials 不可用时。
  */
-async function rotateLoginSecret(scope, config, runtime, deps = REAL_DEPS) {
+async function rotateLoginSecret(scope, config, runtime, deps = REAL_DEPS, requestingAuthority) {
   if (!config.loginRoute) throw new Error('登录入口已关闭（loginRoute=false），没有可更换的密钥')
   const state = runtime.state
   if (state === undefined) throw new Error('远程访问还没就绪，稍后再试')
 
   const connection = scope.get('connection', false)
+
+  // 先吊销会话，再装新路由：反过来的话，若吊销失败就已经把新密钥写出去了，
+  // 用户会以为换成功了，而泄露的那张 cookie 还活着。
+  if (config.revokeSessionsOnRotate) await rotateSessionSecret(scope)
+
   const secret = randomBytes(24).toString('base64url')
   const loginPath = installLoginRoute(runtime, connection, config, state.authority, secret)
   if (loginPath === undefined) throw new Error('webServer 不可用，换不了密钥')
@@ -575,7 +661,25 @@ async function rotateLoginSecret(scope, config, runtime, deps = REAL_DEPS) {
   runtime.state = next
   runtime.handoffUrl = handoffUrl
   if (runtime.undo !== undefined) runtime.undo.loginPath = loginPath
-  return { loginUrl, loginPath, updatedAt: next.updatedAt }
+
+  // 给**发起请求的那个 authority** 补一张新 cookie，让点按钮的这台设备不掉线。
+  // 只能补这一个：cookie 按 authority 命名并签名，给别的 authority 种的 cookie
+  // 浏览器会直接忽略。
+  let stayedSignedIn = false
+  if (config.revokeSessionsOnRotate && typeof requestingAuthority === 'string' && requestingAuthority !== '') {
+    const minted = mintSessionCookie(connection, requestingAuthority, config.cookieMaxAgeDays * 86400000)
+    if (minted !== undefined) stayedSignedIn = true
+    return {
+      loginUrl,
+      loginPath,
+      updatedAt: next.updatedAt,
+      revokesSessions: true,
+      stayedSignedIn,
+      cookie: minted === undefined ? null : sessionCookieHeader(minted),
+    }
+  }
+
+  return { loginUrl, loginPath, updatedAt: next.updatedAt, revokesSessions: config.revokeSessionsOnRotate, stayedSignedIn }
 }
 
 /**
@@ -592,10 +696,14 @@ function registerAdminRoutes(scope, config, runtime) {
   const routes = connection?.fetch
   if (routes === undefined) return
 
-  const json = (payload, status = 200) =>
+  const json = (payload, status = 200, extraHeaders) =>
     new Response(JSON.stringify(payload), {
       status,
-      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+        ...(extraHeaders ?? {}),
+      },
     })
 
   // 每条路由都显式挂在自己的 effect 上。
@@ -621,9 +729,19 @@ function registerAdminRoutes(scope, config, runtime) {
         path: ROTATE_PATH,
         methods: ['POST'],
         requestBody: 'buffered',
-        fetch: async () => {
+        fetch: async (request) => {
           try {
-            return json({ ok: true, ...(await rotateLoginSecret(scope, config, runtime)) })
+            const result = await rotateLoginSecret(
+              scope,
+              config,
+              runtime,
+              REAL_DEPS,
+              hostAuthority(request?.headers),
+            )
+            // 补发的 cookie 必须由 HTTP 响应带走；放在 body 里没用。
+            const cookie = typeof result.cookie === 'string' ? { 'set-cookie': result.cookie } : undefined
+            const { cookie: _omitted, ...payload } = result
+            return json({ ok: true, ...payload }, 200, cookie)
           } catch (error) {
             return json({ ok: false, error: String(error?.message ?? error) }, 409)
           }
@@ -993,6 +1111,8 @@ export const internals = {
   statePayload,
   installLoginRoute,
   rotateLoginSecret,
+  rotateSessionSecret,
+  hostAuthority,
   registerAdminRoutes,
   freshRuntime,
   setup,
@@ -1000,4 +1120,5 @@ export const internals = {
   REAL_DEPS,
   STATE_PATH,
   ROTATE_PATH,
+  AUTH_RECORD_KEY,
 }

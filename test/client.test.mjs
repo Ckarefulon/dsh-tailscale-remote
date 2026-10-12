@@ -591,4 +591,67 @@ describe('换密钥', () => {
     assert.ok(text.includes('还没起来'), `应当用 body 里的 error，实际：${text}`)
     assert.equal(text.includes('503'), false, '不该拿状态码覆盖掉真正的原因')
   })
+
+  /**
+   * 换密钥的警告文案必须跟着**实际行为**走。
+   *
+   * 这是最容易变成谎言的一处：默认行为是连会话一起吊销（所有设备退出），
+   * 如果文案还写着「已经登录的设备不受影响」，用户就会以为只是换个链接，
+   * 结果手机被踢下线还不知道为什么。
+   */
+  it('revokesSessions=true 时，警告明说所有设备都会退出', async () => {
+    const { tree, renderer, registration, props } = await renderRow({
+      locale: ZH_LOCALE,
+      fetch: async () => ({
+        status: 200,
+        json: async () => ({
+          ok: true,
+          phase: 'ready',
+          canRotate: true,
+          revokesSessions: true,
+          loginUrl: 'https://host.ts.net:7259/remote/OLD',
+          plainUrl: 'https://host.ts.net:7259/',
+          cookieMaxAgeDays: 3650,
+        }),
+      }),
+    })
+    buttonWith(tree, '更换密钥').props.onClick()
+    await renderer.flush()
+    const text = (function collect(node, out = []) {
+      if (typeof node === 'string') out.push(node)
+      else if (Array.isArray(node)) node.forEach((c) => collect(c, out))
+      else if (node !== null && typeof node === 'object' && node.children !== undefined) collect(node.children, out)
+      return out
+    })(renderer.render(registration.component, props)).join('\n')
+    assert.ok(text.includes('所有已登录的设备都会退出'), `警告必须说清后果，实际：${text}`)
+    assert.equal(text.includes('不受影响'), false, '不能同时说「不受影响」——那是反的')
+  })
+
+  it('revokesSessions=false 时才说「已登录的设备不受影响」', async () => {
+    const { tree, renderer, registration, props } = await renderRow({
+      locale: ZH_LOCALE,
+      fetch: async () => ({
+        status: 200,
+        json: async () => ({
+          ok: true,
+          phase: 'ready',
+          canRotate: true,
+          revokesSessions: false,
+          loginUrl: 'https://host.ts.net:7259/remote/OLD',
+          plainUrl: 'https://host.ts.net:7259/',
+          cookieMaxAgeDays: 3650,
+        }),
+      }),
+    })
+    buttonWith(tree, '更换密钥').props.onClick()
+    await renderer.flush()
+    const text = (function collect(node, out = []) {
+      if (typeof node === 'string') out.push(node)
+      else if (Array.isArray(node)) node.forEach((c) => collect(c, out))
+      else if (node !== null && typeof node === 'object' && node.children !== undefined) collect(node.children, out)
+      return out
+    })(renderer.render(registration.component, props)).join('\n')
+    assert.ok(text.includes('不受影响'), `实际：${text}`)
+    assert.equal(text.includes('所有已登录的设备都会退出'), false)
+  })
 })

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Tailscale remote access",
-    "description": "Publishes the DSH Web GUI on your tailnet whenever DSH runs, so a phone anywhere can connect, and removes the route on exit. The phone link is shown in Settings -> General -> Phone access; copy it with one click, and change the key there too."
+    "description": "Publishes the DSH Web GUI on your tailnet whenever DSH runs, so a phone anywhere can connect, and removes the route on exit. The phone link is in Settings -> General -> Phone access; copy it with one click, and if it ever leaks, rotate the key there so the old link and every old session stop working."
   }
 }

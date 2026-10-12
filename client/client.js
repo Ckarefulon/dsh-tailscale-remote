@@ -56,8 +56,10 @@ window.__ModuleLoader__.load({
 			rotate: '更换密钥',
 			rotateConfirm: '确认更换',
 			rotateCancel: '取消',
-			rotateWarning: '换完之后旧链接立刻失效，需要把新链接重新存一次书签。已经登录过的手机不受影响。',
-			rotateDone: '已更换。请重新保存下面的链接。',
+			rotateWarningRevoke: '换完之后旧链接立刻失效，所有已登录的设备都会退出（包括你的手机），需要用新链接重新登录一次。这台设备会被自动保留登录状态。',
+			rotateWarningLinkOnly: '换完之后旧链接立刻失效，需要把新链接重新存一次书签。已经登录过的设备不受影响。',
+			rotateDoneRevoke: '已更换。旧密钥与所有旧登录都已失效，请把新链接重新存一次书签。',
+			rotateDoneLinkOnly: '已更换。请重新保存下面的链接。',
 			rotateFailed: '更换失败',
 			noLogin: '登录入口已关闭（loginRoute=false），下面的直连地址需要先在本机用一次性令牌登录。',
 			keepBookmark: '存一次书签即可，跨重启不变。',
@@ -80,8 +82,10 @@ window.__ModuleLoader__.load({
 			rotate: 'Change key',
 			rotateConfirm: 'Confirm change',
 			rotateCancel: 'Cancel',
-			rotateWarning: 'The old link stops working immediately; bookmark the new one. Phones already signed in are unaffected.',
-			rotateDone: 'Changed. Save the link below again.',
+			rotateWarningRevoke: 'The old link stops working immediately and every signed-in device is signed out, including your phone — sign in again with the new link. This device stays signed in.',
+			rotateWarningLinkOnly: 'The old link stops working immediately; bookmark the new one. Devices already signed in are unaffected.',
+			rotateDoneRevoke: 'Changed. The old key and every old session are now invalid; save the new link again.',
+			rotateDoneLinkOnly: 'Changed. Save the link below again.',
 			rotateFailed: 'Change failed',
 			noLogin: 'The login entry is off (loginRoute=false); the direct address needs a one-time token login from this machine first.',
 			keepBookmark: 'Bookmark it once — it survives restarts.',
@@ -308,10 +312,14 @@ window.__ModuleLoader__.load({
 					return
 				}
 				setState((previous) => ({ ...(previous ?? {}), ...result.data }))
-				setNotice(t.rotateDone)
+				setNotice(result.data.revokesSessions === false ? t.rotateDoneLinkOnly : t.rotateDoneRevoke)
 			}, [t])
 
 			const canRotate = state !== null && state.canRotate === true && !busy
+			// 文案必须跟着实际行为走：吊销会话时警告要说清「所有设备都会退出」，
+			// 否则用户以为只是换个链接，结果手机被踢下线、还不知道为什么。
+			const revokes = state !== null && state.revokesSessions === true
+			const warningText = revokes ? t.rotateWarningRevoke : t.rotateWarningLinkOnly
 
 			// 首帧：还没拿到状态，也没出错。这时不要摆一个空输入框配一个会误导的标签，
 			// 直接说「正在读取」。
@@ -401,7 +409,7 @@ window.__ModuleLoader__.load({
 						copied ? t.copied : t.copy,
 					),
 				),
-				confirming ? h('div', { style: styles.warn }, t.rotateWarning) : null,
+				confirming ? h('div', { style: styles.warn }, warningText) : null,
 				notice === null ? null : h('div', { style: styles.warn }, notice),
 				error !== null
 					? h(
