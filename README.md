@@ -1,16 +1,18 @@
 # dsh-tailscale-remote
 
 打开 DSH 就把本机 Web GUI 通过 **Tailscale Serve** 暴露到你的 tailnet 上，手机在任何网络下
-打开一个网址就能用；DSH 退出时把这条路由撤掉。
+打开一个网址就能用；DSH 退出时把这条路由撤掉。手机链接直接显示在
+**「设置 → 通用 → 手机连接」**里，点一下就能复制。
 
 > 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）用的插件。
 > 只需要「随时随地用手机连上自己电脑上的 DSH」这一件事，不引入任何第三方中转。
 
 ## 先看这个：手机怎么进
 
-DSH 的 Web GUI 要求一次**登录令牌**，没令牌只显示一句
-`dsh web authentication required; ...`。DSH Desktop 又**从不打印**那行链接，令牌还每次重启都换 ——
-所以插件给你一条**存一次就永久用**的入口：
+**最省事的办法：DSH 里打开「设置 → 通用」，往下找到「手机连接」那一行，里面就有链接，
+点一下「复制」，发到手机上打开一次即可。** 那一行还能随时「更换密钥」。
+
+不想开 DSH 界面时，读状态文件也一样（字段是 `loginUrl`）：
 
 ```sh
 # 装好并重启 DSH 后，执行（Windows 用 PowerShell 见下）
@@ -32,7 +34,11 @@ Windows PowerShell 读法：
 Get-Content "$env:USERPROFILE\.dsh\tailscale-remote.json"
 ```
 
-就这么两步：**读 `loginUrl` → 手机打开一次并存书签**。下面都是细节。
+就这么两步：**拿到 `loginUrl` → 手机打开一次并存书签**。下面都是细节。
+
+> DSH 的 Web GUI 要求一次**登录令牌**，没令牌只显示一句
+> `dsh web authentication required; ...`。DSH Desktop 又**从不打印**那行链接，令牌还每次重启都换 ——
+> 所以插件给你一条**存一次就永久用**的入口。
 
 ## 安装
 
@@ -83,9 +89,22 @@ dsh web authentication required; reopen the URL printed by dsh web.
 ```
 
 麻烦的地方在于：**DSH Desktop 从不打印这行链接**（它走 IPC，不走 `dsh web`），而令牌又是
-**进程级**的、每次重启都换。所以本插件做了两件事，让你**只需要拿一次链接**：
+**进程级**的、每次重启都换。所以本插件给你三个拿链接的地方，任选其一。
 
-### ① 稳定登录入口（推荐，存一次书签就够）
+### ① 设置页里的「手机连接」行（推荐）
+
+**设置 → 通用**，滚到下面有「手机连接」这一行：
+
+- 里面是**手机登录链接**，一个只读输入框 + 「复制」按钮，点一下就能发到手机上。
+- 旁边有「更换密钥」：点一下会先让你确认，确认后立刻换一把新密钥并**让旧链接失效**。
+  - 已经登录过的手机**不受影响**（DSH 的会话 cookie 由另一个签名密钥签发，和登录密钥无关）。
+  - 换完之后把新链接重新存一次书签即可。
+- 还没就绪时会直接告诉你卡在哪一步（比如「Tailscale 没在运行」），而不是给你一个空框。
+
+> 这一行只在你**打开设置页**时才请求一次状态（外加窗口重新获得焦点时刷新一次），
+> 不轮询、不挂定时器。它注册在 DSH 自己的 `/api` 上，所以**只有已登录的浏览器**能读。
+
+### ② 稳定登录入口（存一次书签就够）
 
 插件会在 DSH 自己的 webserver 上注册一条路由：
 
@@ -100,7 +119,7 @@ https://<你的机器>.<tailnet>.ts.net:7259/remote/<持久密钥>
 > 密钥本身就是访问门槛：不知道它的人拿不到会话（和 DSH 自己的令牌同一级别）。
 > 不需要的话可以设 `loginRoute: false` 关掉。
 
-### ② 状态文件（永远可以查到）
+### ③ 状态文件（永远可以查到）
 
 任何一次启动后，下面这个文件里都有**当前**可用的链接：
 
@@ -147,7 +166,7 @@ cookie 种下后，直接访问干净地址 `https://<机器>.<tailnet>.ts.net:7
 | `serveOnStart` | `true` | 是否建立 Serve 路由。 |
 | `teardownOnExit` | `true` | 退出时是否回滚。 |
 | `trustedHosts` | `true` | 是否把该 authority 加进 `/api` 信任列表。 |
-| `loginRoute` | `true` | 是否注册 `/remote/<持久密钥>` 这个稳定登录入口。 |
+| `loginRoute` | `true` | 是否注册 `/remote/<持久密钥>` 这个稳定登录入口（设置页那一行的「更换密钥」也依赖它）。 |
 | `cookieMaxAgeDays` | `3650` | 登录 cookie 有效期（天）。`0` = 不插手 DSH 的 30 天默认值。 |
 | `binaryPath` | 自动探测 | `tailscale` CLI 可执行文件路径。 |
 | `guiPath` | 自动探测 | Tailscale **桌面客户端**路径（Windows 默认 `tailscale-ipn.exe`）。 |
@@ -224,6 +243,22 @@ Trusted Publisher **只能绑到 registry 上已存在的包**，所以**首次�
 这条路由**只对你的 tailnet 可见**（Tailscale Serve 的默认范围，不是 Funnel），也就是说
 只有登录到你这个 tailnet 的设备能连上。DSH 自己的浏览器鉴权（30 天签名 cookie）仍然
 生效，两层是叠加的。
+
+设置页那一行背后的两个端点注册在 DSH 自己的 `/api` 前缀路由上
+（`connection.fetch`），因此**直接白拿 DSH 的 Host/Origin fence 与浏览器 cookie 鉴权**：
+未登录的请求在到达插件之前就被 401 挡掉了。它们也刻意**不用**
+`webServer.register({ kind: 'exact', path: '/api/...' })` —— `webserver` 的 `match()`
+先查 exact 表，那样会**抢先命中**并遮掉整条 `/api` 路由，把 fence 和鉴权一起绕过去。
+
+| 端点 | 作用 |
+| --- | --- |
+| `GET /api/dsh-tailscale-remote/state` | 当前阶段、手机链接、能否换密钥。不缓存。 |
+| `POST /api/dsh-tailscale-remote/rotate` | 换一把新登录密钥，并让旧链接立刻失效。 |
+
+「换密钥」只换**登录入口的密钥**，不动 DSH 的会话 cookie 签名密钥，所以已经登录的手机
+不会被踢下线 —— 这也是为什么它足够安全：它收回的是「谁还能用那条链接登录」，不是
+「谁现在是登录状态」。想彻底踢掉已登录设备，去改 DSH 自己的凭据（那会换掉签名密钥，
+所有 cookie 一起失效）。
 
 插件**不会覆盖** 7259 上已有的、指向别处的 Serve 配置：检测到冲突就只记日志、不动手。
 唯一会接管的情况是发现一条指向**另一个回环端口**的陈旧路由（通常是上次 DSH 换了端口

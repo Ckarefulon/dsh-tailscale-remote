@@ -436,16 +436,234 @@ function sessionCookieHeader(minted) {
 }
 
 /**
+ * 设置页那一行读的两个管理端点。
+ *
+ * 注册在 `connection.fetch` 上而**不是** `webServer.register`：`/api` 那条前缀路由
+ * 上挂着 DSH 自己的 Host/Origin fence 与浏览器 cookie 鉴权（`connection.admit`），
+ * 注册到 `connection.fetch` 等于白拿这套策略。反过来，用 `webServer.register` 建一条
+ * exact 的 `/api/...` 会**抢先命中** `match()` 的 exact 表，把整条 `/api` 前缀路由遮掉。
+ */
+const STATE_PATH = '/api/dsh-tailscale-remote/state'
+const ROTATE_PATH = '/api/dsh-tailscale-remote/rotate'
+
+/**
+ * 组装管理端点要返回的状态。
+ *
+ * 刻意**不抛**：「还在启动」「起不来」都是设置页要看的正常答案，不是错误响应。
+ * @param config - 归一化后的配置。
+ * @param runtime - 本次运行的活状态（见 `apply`）。
+ */
+function statePayload(config, runtime) {
+  const state = runtime.state
+  return {
+    ok: true,
+    enabled: config.enabled,
+    phase: runtime.phase,
+    error: runtime.error ?? null,
+    // 只有「已就绪」才谈得上换密钥：换密钥要写回状态文件并重建登录路由。
+    canRotate: config.enabled && config.loginRoute && runtime.phase === 'ready',
+    plainUrl: state?.plainUrl ?? null,
+    loginUrl: state?.loginUrl ?? null,
+    authority: state?.authority ?? null,
+    dnsName: state?.dnsName ?? null,
+    httpsPort: state?.httpsPort ?? config.httpsPort,
+    cookieMaxAgeDays: state?.cookieMaxAgeDays ?? config.cookieMaxAgeDays,
+    updatedAt: state?.updatedAt ?? null,
+  }
+}
+
+/**
+ * 注册（或换成）登录入口路由。
+ *
+ * 换密钥时**必须先撤掉旧的**：路由表按 `(kind, path)` 去重，路径变了不会报冲突，
+ * 于是旧链接会继续可用 —— 那会让「换完之后旧链接立刻失效」变成谎话。
+ * @param runtime - 活状态；`webScope` 缺席时什么都不做。
+ * @param connection - `connection` 服务（取签名密钥用）。
+ * @param config - 归一化后的配置。
+ * @param authority - `<dnsName>:<httpsPort>`。
+ * @param secret - 要用的密钥。
+ * @returns 新路径；装不上时返回 undefined。
+ */
+function installLoginRoute(runtime, connection, config, authority, secret) {
+  const webScope = runtime.webScope
+  if (webScope === undefined) return undefined
+  const webServer = webScope.get('webServer')
+  if (webServer === undefined) return undefined
+
+  runtime.login?.dispose?.()
+  runtime.login = undefined
+
+  const path = `/remote/${secret}`
+  const dispose = webScope.effect(
+    () =>
+      webServer.register({
+        kind: 'exact',
+        path,
+        handler: (req, res) => {
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.writeHead(405)
+            res.end()
+            return
+          }
+          // 首选：自己铸 cookie，一跳到位（见 mintSessionCookie 的说明）。
+          const minted = mintSessionCookie(connection, authority, config.cookieMaxAgeDays * 86400000)
+          if (minted !== undefined) {
+            res.writeHead(302, {
+              location: `https://${authority}/`,
+              'set-cookie': sessionCookieHeader(minted),
+              'cache-control': 'no-store',
+              'referrer-policy': 'no-referrer',
+            })
+            res.end()
+            return
+          }
+          // 回落：拿不到签名密钥时走 DSH 自己的令牌链。
+          res.writeHead(302, {
+            location: runtime.handoffUrl ?? `https://${authority}/`,
+            'cache-control': 'no-store',
+            'referrer-policy': 'no-referrer',
+          })
+          res.end()
+        },
+      }),
+    'tailscale-remote: login route',
+  )
+
+  runtime.login = { secret, path, dispose }
+  return path
+}
+
+/**
+ * 换一个新密钥：装上新路由 → 写回状态文件 → 更新活状态。
+ *
+ * 已经登录过的手机**不受影响**：DSH 的会话 cookie 由 `browserAuth.secret` 签名，
+ * 和这个登录密钥无关，换密钥只让「拿旧链接重新登录」失效。
+ * @param scope - 带 `connection` 的上下文。
+ * @param config - 归一化后的配置。
+ * @param runtime - 活状态。
+ * @param deps - 依赖注入（测试替换用）。
+ * @returns `{ loginUrl, loginPath, updatedAt }`。
+ * @throws 未就绪 / 登录入口已关闭 / webServer 不可用时。
+ */
+async function rotateLoginSecret(scope, config, runtime, deps = REAL_DEPS) {
+  if (!config.loginRoute) throw new Error('登录入口已关闭（loginRoute=false），没有可更换的密钥')
+  const state = runtime.state
+  if (state === undefined) throw new Error('远程访问还没就绪，稍后再试')
+
+  const connection = scope.get('connection', false)
+  const secret = randomBytes(24).toString('base64url')
+  const loginPath = installLoginRoute(runtime, connection, config, state.authority, secret)
+  if (loginPath === undefined) throw new Error('webServer 不可用，换不了密钥')
+
+  const loginUrl = `https://${state.authority}${loginPath}`
+  let handoffUrl = state.plainUrl
+  try {
+    handoffUrl = connection?.authenticatedUrl?.(state.plainUrl) ?? state.plainUrl
+  } catch {
+    handoffUrl = state.plainUrl
+  }
+
+  const next = {
+    ...state,
+    url: handoffUrl,
+    loginUrl,
+    loginPath,
+    loginSecret: secret,
+    updatedAt: new Date().toISOString(),
+  }
+  await deps.persistState(scope, next)
+  runtime.state = next
+  runtime.handoffUrl = handoffUrl
+  if (runtime.undo !== undefined) runtime.undo.loginPath = loginPath
+  return { loginUrl, loginPath, updatedAt: next.updatedAt }
+}
+
+/**
+ * 注册管理端点。
+ *
+ * 即便 `enabled=false` 也注册：设置页那一行要能回答「为什么没起来」，
+ * 而不是只能看到一个 404。
+ * @param scope - 带 `connection` 的上下文。
+ * @param config - 归一化后的配置。
+ * @param runtime - 活状态。
+ */
+function registerAdminRoutes(scope, config, runtime) {
+  const connection = scope.get('connection', false)
+  const routes = connection?.fetch
+  if (routes === undefined) return
+
+  const json = (payload, status = 200) =>
+    new Response(JSON.stringify(payload), {
+      status,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    })
+
+  // 每条路由都显式挂在自己的 effect 上。
+  //
+  // `connection.fetch.register` 内部**确实**会用「读服务的那个 ctx」调 `owner.effect`，
+  // 但那个 ctx 来自 cordis 的服务代理在调用点绑定 —— 与其依赖这条链路，不如自己
+  // 明确声明生命周期：`scope.effect(() => routes.register(...))` 拿返回的 disposer
+  // 作为清理函数，插件卸载时路由一定跟着走，不多不少。
+  scope.effect(
+    () =>
+      routes.register({
+        path: STATE_PATH,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: () => Promise.resolve(json(statePayload(config, runtime))),
+      }),
+    'tailscale-remote: state route',
+  )
+
+  scope.effect(
+    () =>
+      routes.register({
+        path: ROTATE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async () => {
+          try {
+            return json({ ok: true, ...(await rotateLoginSecret(scope, config, runtime)) })
+          } catch (error) {
+            return json({ ok: false, error: String(error?.message ?? error) }, 409)
+          }
+        },
+      }),
+    'tailscale-remote: rotate route',
+  )
+}
+
+/**
+ * 本次运行的活状态。
+ *
+ * 设置页那一行要能回答「现在到哪一步了」，而 `setup` 的返回值只够写日志；
+ * 这里把阶段、错误、状态快照和已装的登录路由都挂在一个对象上，`apply` 建一次、
+ * `setup` 往里写、管理端点读。
+ * @param undo - 本次运行的回滚清单（换密钥时要更新它的 loginPath）。
+ */
+function freshRuntime(undo) {
+  return {
+    phase: 'starting',
+    error: undefined,
+    /** 最近一次写盘的状态快照（见 `setup` 末尾）。 */
+    state: undefined,
+    /** 登录入口落地的那个 webServer 作用域；换密钥时复用它。 */
+    webScope: undefined,
+    /** 当前登录路由 `{ secret, path, dispose }`；换密钥时先撤掉它。 */
+    login: undefined,
+    /** 回落跳转用的带令牌地址。 */
+    handoffUrl: undefined,
+    undo,
+  }
+}
+
+/**
  * 插件入口。
  * @param {import('@deepseek-ai/cordis').Context} ctx - 插件上下文。
  * @param {unknown} rawConfig - 该行声明的 config。
  */
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig)
-  if (!config.enabled) {
-    ctx.logger.info('tailscale-remote: enabled=false，插件不动作')
-    return
-  }
 
   // connection 是可选依赖：服务晚到也会触发，永不出现则保持静默。
   // 服务只从 scope 参数上取（inject 新建的 fiber 的 store 里才有它）。
@@ -466,6 +684,18 @@ export function apply(ctx, rawConfig) {
       loginPath: undefined,
       disposed: false,
     }
+    const runtime = freshRuntime(undo)
+
+    // 管理端点**即便 enabled=false 也注册**：设置页那一行要能回答「为什么没起来」，
+    // 而不是只能看到一个 404。客户端半边是独立声明的，禁用时照样会加载并渲染这一行。
+    if (!config.enabled) {
+      runtime.phase = 'disabled'
+      ctx.logger.info('tailscale-remote: enabled=false，只提供设置页状态，不动作')
+      registerAdminRoutes(scope, config, runtime)
+      return
+    }
+
+    registerAdminRoutes(scope, config, runtime)
 
     // 退出清理挂在这里：这是唯一可靠的关停挂点，且 disposer 绝不能 reject。
     scope.effect(() => async () => {
@@ -477,8 +707,10 @@ export function apply(ctx, rawConfig) {
     }, 'tailscale-remote: teardown')
 
     // 启动流程异步跑，不阻塞 Loader 装配。
-    setup(scope, config, undo).catch((error) => {
-      scope.logger.warn(`tailscale-remote: 启动失败：${String(error?.message ?? error)}`)
+    setup(scope, config, undo, REAL_DEPS, runtime).catch((error) => {
+      runtime.phase = 'error'
+      runtime.error = String(error?.message ?? error)
+      scope.logger.warn(`tailscale-remote: 启动失败：${runtime.error}`)
     })
   })
 }
@@ -499,10 +731,15 @@ const REAL_DEPS = {
 }
 
 /** 启动：拉起 tailscale → 建 serve 路由 → 信任该 authority → 打印手机可用的链接。 */
-async function setup(scope, config, undo, deps = REAL_DEPS) {
+async function setup(scope, config, undo, deps = REAL_DEPS, runtime = freshRuntime(undo)) {
   const logger = scope.logger
+  runtime.undo = undo
+  runtime.phase = 'starting'
+  runtime.error = undefined
   const binary = await deps.resolveBinary(scope, config.binaryPath)
   if (binary === undefined) {
+    runtime.phase = 'unavailable'
+    runtime.error = '找不到 tailscale 可执行文件'
     logger.warn('tailscale-remote: 找不到 tailscale 可执行文件；请安装 Tailscale 或用 config.binaryPath 指定路径')
     return
   }
@@ -515,11 +752,17 @@ async function setup(scope, config, undo, deps = REAL_DEPS) {
   // 关键：必须验证 backend 真的 Running，不能只信 `tailscale up` 的退出码
   // （Windows 上客户端被完全退出时，up 会 exit 0 但什么都不做）。
   const running = await ensureRunning(binary, config, deps, logger, undo)
-  if (!running) return
+  if (!running) {
+    runtime.phase = 'unavailable'
+    runtime.error = 'tailscale 没在运行'
+    return
+  }
   if (!wasRunning) status = await deps.readStatus(binary)
 
   const dnsName = dnsNameOf(status)
   if (dnsName === undefined) {
+    runtime.phase = 'unavailable'
+    runtime.error = '读不到 tailnet DNS 名称'
     logger.warn('tailscale-remote: 读不到 tailnet DNS 名称，跳过 Serve 配置')
     return
   }
@@ -527,6 +770,8 @@ async function setup(scope, config, undo, deps = REAL_DEPS) {
   // DSH 自己的 Web 端口从服务上读，绝不写死。
   const port = await deps.waitForPort(scope)
   if (port === undefined) {
+    runtime.phase = 'unavailable'
+    runtime.error = '等不到 DSH Web 端口'
     logger.warn('tailscale-remote: 等不到 DSH Web 端口，跳过 Serve 配置')
     return
   }
@@ -538,6 +783,8 @@ async function setup(scope, config, undo, deps = REAL_DEPS) {
     const serveStatus = await deps.readServeStatus(binary)
     const state = classifyServe(serveStatus, config.httpsPort, target)
     if (state.kind === 'conflict') {
+      runtime.phase = 'error'
+      runtime.error = `${String(config.httpsPort)} 端口上有冲突的 Serve 配置（${state.reason}）`
       logger.warn(`tailscale-remote: ${String(config.httpsPort)} 端口上有冲突的 Serve 配置（${state.reason}），不覆盖`)
       return
     }
@@ -554,8 +801,11 @@ async function setup(scope, config, undo, deps = REAL_DEPS) {
       }
       const serve = await deps.run(binary, ['serve', '--bg', `--https=${String(config.httpsPort)}`, target], SETUP_TIMEOUT_MS)
       if (!serve.ok) {
+        const detail = (serve.stderr || serve.stdout).trim().slice(0, 300)
+        runtime.phase = 'error'
+        runtime.error = detail === '' ? '配置 Serve 失败' : detail
         logger.warn(
-          `tailscale-remote: 配置 Serve 失败: ${(serve.stderr || serve.stdout).trim().slice(0, 300)}；` +
+          `tailscale-remote: 配置 Serve 失败: ${detail}；` +
             '若提示 HTTPS 证书，请先在 Tailscale 管理台为该 tailnet 启用 HTTPS 证书',
         )
         return
@@ -593,18 +843,6 @@ async function setup(scope, config, undo, deps = REAL_DEPS) {
     }
   }
 
-  // 稳定的登录入口：/remote/<持久密钥> → 302 到带令牌的地址。
-  // 令牌每次都变、用户没法存书签；这条路径的密钥写在状态文件里，**跨重启不变**，
-  // 所以手机上存一次就够了。密钥同时充当访问门槛（不知道密钥的人拿不到会话）。
-  let loginUrl = plainUrl
-  let loginPath
-  if (config.loginRoute) {
-    const secret = await deps.ensureLoginSecret(scope, config, deps)
-    loginPath = `/remote/${secret}`
-    loginUrl = `https://${authority}${loginPath}`
-    undo.loginPath = loginPath
-  }
-
   let handoffUrl = plainUrl
   try {
     // authenticatedUrl 会把本进程的启动令牌加到链接上；首次打开会种下 cookie。
@@ -612,54 +850,31 @@ async function setup(scope, config, undo, deps = REAL_DEPS) {
   } catch {
     handoffUrl = plainUrl
   }
+  runtime.handoffUrl = handoffUrl
 
-  // 登录入口的跳转目标就是上面这个带令牌的地址；注册在 DSH 自己的 webserver 上
-  // （所以不需要第二个端口、也不需要额外的 tailscale serve 路由）。
-  if (loginPath !== undefined) {
-    const registerLoginRoute = (webScope) => {
-      const webServer = webScope.get('webServer')
-      if (webServer === undefined) return
-      webScope.effect(
-        () =>
-          webServer.register({
-            kind: 'exact',
-            path: loginPath,
-            handler: (req, res) => {
-              if (req.method !== 'GET' && req.method !== 'HEAD') {
-                res.writeHead(405)
-                res.end()
-                return
-              }
-              // 首选：自己铸 cookie，一跳到位（见 mintSessionCookie 的说明）。
-              const minted = mintSessionCookie(connection, authority, config.cookieMaxAgeDays * 86400000)
-              if (minted !== undefined) {
-                res.writeHead(302, {
-                  location: `https://${authority}/`,
-                  'set-cookie': sessionCookieHeader(minted),
-                  'cache-control': 'no-store',
-                  'referrer-policy': 'no-referrer',
-                })
-                res.end()
-                return
-              }
-              // 回落：拿不到签名密钥时走 DSH 自己的令牌链。
-              res.writeHead(302, {
-                location: handoffUrl,
-                'cache-control': 'no-store',
-                'referrer-policy': 'no-referrer',
-              })
-              res.end()
-            },
-          }),
-        'tailscale-remote: login route',
-      )
-    }
+  // 稳定的登录入口：/remote/<持久密钥> → 302 到带令牌的地址。
+  // 令牌每次都变、用户没法存书签；这条路径的密钥写在状态文件里，**跨重启不变**，
+  // 所以手机上存一次就够了。密钥同时充当访问门槛（不知道密钥的人拿不到会话）。
+  let loginUrl = plainUrl
+  let loginPath
+  if (config.loginRoute) {
+    const secret = await deps.ensureLoginSecret(scope, config, deps)
+    // 路径在这里**同步**算出来：`scope.inject` 的服务晚到时回调是异步的，
+    // 若等回调再算，webServer 迟到就会让状态文件里丢掉 loginUrl。
+    loginPath = `/remote/${secret}`
+    loginUrl = `https://${authority}${loginPath}`
+    undo.loginPath = loginPath
+    // 登录入口的跳转目标就是上面这个带令牌的地址；注册在 DSH 自己的 webserver 上
+    // （所以不需要第二个端口、也不需要额外的 tailscale serve 路由）。
     // 嵌套 inject：webServer 缺席时只丢登录入口，tailscale / 信任项照常工作。
-    scope.inject(['webServer'], (webScope) => registerLoginRoute(webScope))
+    scope.inject(['webServer'], (webScope) => {
+      runtime.webScope = webScope
+      installLoginRoute(runtime, connection, config, authority, secret)
+    })
   }
 
   const loginSecret = loginPath === undefined ? undefined : loginPath.slice('/remote/'.length)
-  await deps.persistState(scope, {
+  const snapshot = {
     url: handoffUrl,
     loginUrl,
     loginPath,
@@ -672,7 +887,11 @@ async function setup(scope, config, undo, deps = REAL_DEPS) {
     cookieMaxAgeDays: config.cookieMaxAgeDays,
     updatedAt: new Date().toISOString(),
     stateFile: config.stateFile,
-  })
+  }
+  await deps.persistState(scope, snapshot)
+  runtime.state = snapshot
+  runtime.phase = 'ready'
+  runtime.error = undefined
 
   logger.info(`tailscale-remote: 手机可用地址 ${plainUrl}`)
   if (loginUrl !== plainUrl) {
@@ -771,7 +990,14 @@ export const internals = {
   ensureLoginSecret,
   mintSessionCookie,
   sessionCookieHeader,
+  statePayload,
+  installLoginRoute,
+  rotateLoginSecret,
+  registerAdminRoutes,
+  freshRuntime,
   setup,
   teardown,
   REAL_DEPS,
+  STATE_PATH,
+  ROTATE_PATH,
 }
