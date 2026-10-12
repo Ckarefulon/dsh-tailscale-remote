@@ -52,6 +52,17 @@ jobs:
         with:
           node-version: '22'
 
+      # Trusted Publishing is a feature of the npm CLI, not of Node: the OIDC
+      # token exchange lives in npm's own lib/utils/oidc.js, which exists in
+      # npm 11.5.1+ and NOT in the npm 10.x that Node 22 ships. On npm 10 the
+      # exchange never happens, npm falls through to "no credentials", and the
+      # publish dies with ENEEDAUTH -- which reads like a missing token but is
+      # really an npm too old to speak OIDC. Pin the floor explicitly.
+      - name: Ensure an npm that supports Trusted Publishing
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+
       - name: Test
         run: npm test
 
