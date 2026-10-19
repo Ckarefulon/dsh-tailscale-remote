@@ -7,12 +7,14 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  LITE_HIDE,
   LITE_MARKER,
   LITE_REQUIRED,
   LITE_ROUTE,
   LITE_SEEDS,
   composeComboBody,
   composeLiteGraph,
+  encodeComboBody,
   matchLiteRequest,
   rewriteIndex,
   stripClientSuffix,
@@ -292,4 +294,97 @@ test('rewriteIndex：没找到任何 preload 也照样换图（不靠预载行�
   assert.equal(result.changed, true)
   assert.equal(result.removed, 0)
   assert.ok(result.html.includes('"entries"'), '图仍然必须被换掉')
+})
+
+// —— 界面裁剪与压缩 ————————————————————————————————————————————————————————
+
+test('精简种子不含用户点名不要的那几项（设置页 / 轨迹 / 工具 / 附件 / 引用 / 快捷键 UI）', () => {
+  const dropped = [
+    '@deepseek-ai/dsh-client-ui-settings-general',
+    '@deepseek-ai/dsh-client-ui-trajectory',
+    '@deepseek-ai/dsh-client-ui-tool',
+    '@deepseek-ai/dsh-client-ui-attachment',
+    '@deepseek-ai/dsh-client-ui-reference',
+    '@deepseek-ai/dsh-client-ui-shortcuts',
+  ]
+  for (const id of dropped) assert.ok(!LITE_SEEDS.includes(id), `${id} 不该在种子里`)
+  // 但 ui-settings（服务）必须留：它 provide configForms，locale/theme/chat 硬依赖它。
+  assert.ok(LITE_SEEDS.includes('@deepseek-ai/dsh-client-ui-settings'), 'ui-settings 是服务，必须留')
+  assert.ok(!LITE_REQUIRED.includes('@deepseek-ai/dsh-client-ui-settings-general'), '设置页界面不再是必需')
+})
+
+test('sidebar-right 仍会被图边带回来（不能从图里删，只能藏界面）', () => {
+  const full = graphOf([
+    ...LITE_SEEDS.map((id) => ({ id })),
+    { id: '@deepseek-ai/dsh-client-ui-chat', inject: ['@deepseek-ai/dsh-client-ui-sidebar-right'] },
+    { id: '@deepseek-ai/dsh-client-ui-sidebar-right' },
+  ])
+  const lite = composeLiteGraph(full)
+  assert.ok(lite.ids.includes('@deepseek-ai/dsh-client-ui-sidebar-right'), '它必须还在图里（否则 boot 审计会挂）')
+})
+
+test('rewriteIndex 注入隐藏样式，把设置入口 / 右侧栏 / 轨迹藏掉', () => {
+  const lite = composeLiteGraph(sampleGraph())
+  const result = rewriteIndex(sampleIndex(), { lite })
+  assert.equal(result.changed, true)
+
+  assert.ok(result.html.includes('<style data-dsh-tailscale-remote-hide>'), '必须注入隐藏样式')
+  assert.ok(result.html.includes('[data-slot="sidebar.settings"]'), '要藏设置入口')
+  assert.ok(result.html.includes('[data-slot="rightbar"]'), '要藏右侧栏')
+  assert.ok(result.html.includes('button[aria-label="打开右侧边栏"]'), '要藏右侧栏开关')
+  assert.ok(result.html.includes('button[aria-label="收起右侧边栏"]'), '收起态也要藏')
+  // 必须 display:none !important，否则 DSH 自己的类名优先级会盖过去。
+  assert.match(result.html, /\[data-slot="sidebar\.settings"\][^{]*\{display:none !important\}/)
+})
+
+test('rewriteIndex 允许调用方传自己的隐藏列表（config.liteHide）', () => {
+  const lite = composeLiteGraph(sampleGraph())
+  const result = rewriteIndex(sampleIndex(), { lite, hide: ['[data-test-only]'] })
+  assert.ok(result.html.includes('[data-test-only]'))
+  assert.ok(!result.html.includes('[data-slot="sidebar.settings"]'), '传了列表就用传的，不再用默认')
+})
+
+test('encodeComboBody：br 优先、其次 gzip、都不支持就发原文', () => {
+  const raw = Buffer.from('abcdefg'.repeat(2000), 'utf8')
+
+  const br = encodeComboBody(raw, 'gzip, deflate, br, zstd')
+  assert.equal(br.encoding, 'br')
+  assert.ok(br.body.length < raw.length)
+
+  const gz = encodeComboBody(raw, 'gzip, deflate')
+  assert.equal(gz.encoding, 'gzip')
+  assert.ok(gz.body.length < raw.length)
+  assert.ok(br.body.length < gz.body.length, `br ${br.body.length} 应小于 gzip ${gz.body.length}`)
+
+  const none = encodeComboBody(raw, undefined)
+  assert.equal(none.encoding, undefined)
+  assert.equal(none.body, raw, '没协商就原样发')
+
+  const identity = encodeComboBody(raw, 'identity')
+  assert.equal(identity.encoding, undefined, 'identity 不该被当成支持压缩')
+})
+
+test('encodeComboBody：解回来必须与原文逐字一致（否则手机拿到坏脚本）', async () => {
+  const { gunzipSync, brotliDecompressSync } = await import('node:zlib')
+  const raw = Buffer.from('window.__ModuleLoader__.load({id:"x"});\n'.repeat(500), 'utf8')
+  assert.equal(brotliDecompressSync(encodeComboBody(raw, 'br').body).toString('utf8'), raw.toString('utf8'))
+  assert.equal(gunzipSync(encodeComboBody(raw, 'gzip').body).toString('utf8'), raw.toString('utf8'))
+})
+
+
+test('rewriteIndex 也修掉「搜索会话」前面那段硬编码空白（只在这份页面上）', () => {
+  const lite = composeLiteGraph(sampleGraph())
+  const result = rewriteIndex(sampleIndex(), { lite })
+  assert.equal(result.changed, true)
+  // 成因是 searchSlot 自带的 margin-left:146px（实测 DOM），归零即可。
+  assert.match(result.html, /\[class\*="_searchSlot"\]\{margin-left:0 !important/)
+  // 必须仍然留着 flex:0 0 auto，否则按钮会被 flex 挤走。
+  assert.match(result.html, /flex:0 0 auto !important/)
+})
+
+test('布局修正与隐藏规则在同一段 <style> 里，且总共只注入一段', () => {
+  const lite = composeLiteGraph(sampleGraph())
+  const result = rewriteIndex(sampleIndex(), { lite })
+  const styles = result.html.match(/<style data-dsh-tailscale-remote-hide>/g) ?? []
+  assert.equal(styles.length, 1, '只该注入一段 style')
 })

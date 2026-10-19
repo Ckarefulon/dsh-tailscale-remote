@@ -295,7 +295,9 @@ describe('注册', () => {
   it('往「设置 → 通用」注册一行，id 用自己的', () => {
     const { registrations } = applyAndCollect()
     const inject = registrations.filter((r) => r.kind === 'slots.inject')
-    assert.equal(inject.length, 1)
+    // 两处：设置页那一行（手机链接）+ 侧边栏底部的完整模式开关。
+    assert.equal(inject.length, 2)
+    assert.deepEqual(inject.map((r) => r.name).sort(), ['settings.general.item', 'sidebar.footer.action'])
     assert.equal(inject[0].name, 'settings.general.item', '这一行的座位就是通用设置的行插槽')
 
     // register 只在 inject 回调里发生 —— 这正是「插槽还没声明时不要硬注册」的写法。
@@ -311,6 +313,22 @@ describe('注册', () => {
     // 排在 current-version(100) 之前，别顶到最下面去。
     assert.ok(definition.order < 100, 'order 必须小于 current-version 的 100')
     assert.ok(definition.order > 30, 'order 要排在 performance-usage(30) 之后')
+  })
+
+  it('底部开关注册到 sidebar.footer.action（精简页面上它顶替被藏掉的设置入口）', () => {
+    const { registrations } = applyAndCollect()
+    const inject = registrations.filter((r) => r.kind === 'slots.inject')
+    const footer = inject.find((r) => r.name === 'sidebar.footer.action')
+    assert.ok(footer !== undefined, '必须注册到侧边栏底部那个插槽')
+
+    footer.register()
+    const registration = registrations.find(
+      (r) => r.kind === 'slots.register' && r.definition.name === 'sidebar.footer.action',
+    )
+    assert.ok(registration !== undefined)
+    assert.equal(registration.definition.id, 'dsh-tailscale-remote', '用自己的 id')
+    assert.equal(typeof registration.component, 'function')
+    assert.equal(typeof registration.definition.inject, 'function', '要靠 inject 面把 ctx 递进去')
   })
 
   it('注册的不是宿主已有的任何一行', () => {
@@ -448,102 +466,13 @@ describe('渲染出来的一行', () => {
     }
   }
 
-  it('精简模式开着时显示「已开启」和关闭按钮（当前选择一眼可见）', async () => {
+  it('精简开关**不再**出现在设置页那一行里（用户要求只在 Remote 端那处）', async () => {
     const { tree } = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(true) })
     const text = stringsOf(tree).join('\n')
-    assert.ok(text.includes('精简模式'), '要有精简模式这一段的标题')
-    assert.ok(text.includes('已开启'), '当前状态要写出来')
-    assert.ok(text.includes('关闭精简模式'), '开着的时候按钮是「关闭」')
-  })
-
-  it('精简模式关着时显示「已关闭」和开启按钮', async () => {
-    const { tree } = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(false) })
-    const text = stringsOf(tree).join('\n')
-    assert.ok(text.includes('已关闭'))
-    assert.ok(text.includes('开启精简模式'))
-  })
-
-  it('liteAvailable=false 时整段不显示（桌面端摆一个点不动的开关只会显得坏掉）', async () => {
-    const { tree } = await renderRow({
-      locale: ZH_LOCALE,
-      fetch: liteFetch(null, { liteAvailable: false, lite: null, liteChoice: null }),
-    })
-    const boxes = find(tree, (node) => node.props?.['data-dsh-tailscale-remote-lite'] !== undefined)
-    assert.equal(boxes.length, 0, '不可用时不该渲染这一段')
-    assert.equal(stringsOf(tree).join('\n').includes('精简模式'), false)
-  })
-
-  it('页面标记为精简版时才说「这份页面是精简版」', async () => {
-    const withMarker = await renderRow({
-      locale: ZH_LOCALE,
-      fetch: liteFetch(true),
-      window: { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' },
-    })
-    assert.ok(stringsOf(withMarker.tree).join('\n').includes('当前这份页面是精简版'), '有标记时应说精简版')
-
-    const noMarker = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(true) })
-    assert.ok(stringsOf(noMarker.tree).join('\n').includes('当前这份页面是完整版'), '无标记时应说完整版')
-  })
-
-  it('点开关会 POST 到 lite 端点，且带着布尔 enabled（不是字符串）', async () => {
-    const { tree, renderer, calls } = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(true) })
-    const buttons = find(tree, (node) => node.type === 'button' && node.props?.onClick !== undefined)
-    const button = buttons.find((node) => stringsOf(node).includes('关闭精简模式'))
-    assert.ok(button !== undefined, '找不到精简开关按钮')
-
-    button.props.onClick()
-    await renderer.flush()
-
-    const call = calls.find((c) => c.path === '/api/dsh-tailscale-remote/lite')
-    assert.ok(call !== undefined, '必须打到 lite 端点')
-    assert.equal(call.options.method, 'POST')
-    const body = JSON.parse(call.options.body)
-    assert.equal(body.enabled, false, '开着时点一下就关：enabled 必须是 false')
-    assert.equal(typeof body.enabled, 'boolean', 'enabled 必须是布尔值，服务端会拒字符串')
-  })
-
-  it('切换成功后就地更新按钮，并提示「刷新后生效」（否则用户以为按钮坏了）', async () => {
-    const { tree, renderer, registration, props } = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(true) })
-    const button = find(tree, (node) => node.type === 'button' && node.props?.onClick !== undefined).find(
-      (node) => stringsOf(node).includes('关闭精简模式'),
-    )
-    button.props.onClick()
-    await renderer.flush()
-    // 这个夹具不会自动重渲染，所以照换密钥那几条的做法手动重渲染一次。
-    const after = renderer.render(registration.component, props)
-    await renderer.flush()
-
-    const text = stringsOf(after).join('\n')
-    assert.ok(text.includes('关闭精简'), '提示必须说清「刷新后生效」')
-    assert.ok(text.includes('开启精简模式'), '按钮要跟着翻成「开启」（说明本地状态真的更新了）')
-  })
-
-  it('切换失败时把原因显示出来，且不谎报状态', async () => {
-    const failing = async (path, options) => {
-      if (path === '/api/dsh-tailscale-remote/state') return liteFetch(true)(path, options)
-      return { status: 409, json: async () => ({ ok: false, error: '这条 DSH 上没有 Web 渲染路径' }) }
-    }
-    const { tree, renderer, registration, props } = await renderRow({ locale: ZH_LOCALE, fetch: failing })
-    const button = find(tree, (node) => node.type === 'button' && node.props?.onClick !== undefined).find(
-      (node) => stringsOf(node).includes('关闭精简模式'),
-    )
-    button.props.onClick()
-    await renderer.flush()
-    const after = renderer.render(registration.component, props)
-    await renderer.flush()
-
-    const text = stringsOf(after).join('\n')
-    assert.ok(text.includes('切换失败'), '失败必须说出来')
-    assert.ok(text.includes('这条 DSH 上没有 Web 渲染路径'), '要把服务端给的原因带上')
-    assert.ok(text.includes('已开启'), '失败时状态不能翻成「已关闭」')
-  })
-
-  it('英文环境下精简那一段也是英文', async () => {
-    const { tree } = await renderRow({ locale: EN_LOCALE, fetch: liteFetch(true) })
-    const text = stringsOf(tree).join('\n')
-    assert.ok(text.includes('Lite mode'))
-    assert.ok(text.includes('Disable lite mode'))
-    assert.equal(/[\u4e00-\u9fff]/.test(text), false, '英文环境下不该出现中文')
+    // 设置行只负责手机链接与换密钥；精简模式那一段已经移走。
+    assert.equal(text.includes('精简模式'), false, '设置行里不该再有精简模式那一段')
+    assert.ok(text.includes('手机连接'), '手机链接那一行还在')
+    assert.ok(text.includes('更换密钥'), '换密钥还在')
   })
 
   it('绝不用 emoji 当图标（DSH 的图标语言里没有 emoji）', () => {
@@ -579,6 +508,94 @@ describe('渲染出来的一行', () => {
   })
 })
 
+describe('底部那个精简/完整开关图标', () => {
+  function findAll(node, predicate, out = []) {
+    if (node === null || node === undefined || typeof node === 'boolean') return out
+    if (Array.isArray(node)) {
+      for (const child of node) findAll(child, predicate, out)
+      return out
+    }
+    if (typeof node !== 'object') return out
+    if (predicate(node)) out.push(node)
+    if (node.children !== undefined) findAll(node.children, predicate, out)
+    return out
+  }
+  function textOf(node, out = []) {
+    if (typeof node === 'string') out.push(node)
+    else if (Array.isArray(node)) node.forEach((c) => textOf(c, out))
+    else if (node !== null && typeof node === 'object' && node.children !== undefined) textOf(node.children, out)
+    return out
+  }
+
+  /** 按 DSH 图标规范断言一棵 svg 子树。 */
+  function assertDshIcon(svg) {
+    assert.equal(svg.props.width, 16, '按 DSH 图标规范用 16')
+    assert.equal(svg.props.height, 16)
+    assert.equal(svg.props.viewBox, '0 0 16 16')
+    assert.equal(svg.props.fill, 'none')
+    assert.equal(svg.props['aria-hidden'], 'true')
+    assert.equal(typeof svg.props.strokeWidth, 'number')
+    for (const path of [].concat(svg.children ?? [])) {
+      if (path?.type !== 'path') continue
+      assert.equal(path.props.stroke, 'currentColor', '每条 path 用 currentColor')
+      assert.equal(path.props.strokeWidth, undefined, 'strokeWidth 不能写在 path 上')
+    }
+  }
+
+  /** 渲染出那个底部图标（精简页面 + lite 可用）。 */
+  async function renderIcon(overrides = {}) {
+    const fetchImpl = async (path) => {
+      if (path === '/api/dsh-tailscale-remote/state') {
+        return { status: 200, json: async () => ({ ok: true, lite: true, liteAvailable: true, liteCount: 30 }) }
+      }
+      return { status: 200, json: async () => ({ ok: true, lite: true }) }
+    }
+    const { registrations, renderer } = applyAndCollect({ fetch: fetchImpl, ...overrides })
+    const footer = registrations
+      .filter((r) => r.kind === 'slots.inject')
+      .find((r) => r.name === 'sidebar.footer.action')
+    footer.register()
+    const registration = registrations.find(
+      (r) => r.kind === 'slots.register' && r.definition.name === 'sidebar.footer.action',
+    )
+    assert.ok(registration !== undefined, '必须先注册到底部插槽')
+    const props = registration.definition.inject()
+    renderer.render(registration.component, props)
+    await renderer.flush()
+    const tree = renderer.render(registration.component, props)
+    await renderer.flush()
+    return tree
+  }
+
+  it('画的是 16×16 SVG 图标，没有可见文字（用户要求这一处用图标）', async () => {
+    const tree = await renderIcon({ window: { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' } })
+    const buttons = findAll(tree, (node) => node.type === 'button')
+    assert.equal(buttons.length, 1, '应当渲染出一个图标按钮')
+    const button = buttons[0]
+    assert.equal(textOf(button).join('').trim(), '', '按钮里不该有可见文字')
+
+    // 按钮里挂的是图标组件节点（h(LiteSwitchIcon)），夹具不展开函数组件，
+    // 所以按组件引用确认「这里是一个图标而不是文字」，再把组件本身渲一次断言 SVG。
+    const child = [].concat(button.children ?? [])[0]
+    assert.equal(typeof child?.type, 'function', '按钮里必须是图标组件，不是文本')
+
+    // 真渲一次图标组件，按 DSH 图标规范逐条断言。
+    const renderer2 = applyAndCollect({}).renderer
+    const svg = renderer2.render(child.type, child.props)
+    assert.equal(svg.type, 'svg')
+    assertDshIcon(svg)
+
+    // 无障碍文字走 aria-label / title。
+    assert.ok(typeof button.props['aria-label'] === 'string' && button.props['aria-label'].length > 0)
+    assert.ok(typeof button.props.title === 'string' && button.props.title.length > 0)
+  })
+
+  it('完整模式页面里不渲染（那时原生设置入口还在，用不着它）', async () => {
+    // window 上**没有** LITE 标记 = 完整版页面。
+    const tree = await renderIcon({ window: {} })
+    assert.equal(findAll(tree, (node) => node.type === 'button').length, 0, '完整版页面不该有这个图标')
+  })
+})
 describe('换密钥', () => {
   const ZH_LOCALE = { getSnapshot: () => ({ active: 'zh', locales: [], revision: 1 }), subscribe: () => () => {} }
 
@@ -790,4 +807,22 @@ describe('换密钥', () => {
     assert.ok(text.includes('不受影响'), `实际：${text}`)
     assert.equal(text.includes('所有已登录的设备都会退出'), false)
   })
+})
+
+describe('桌面端一个字节都不准动', () => {
+  it('桌面窗口（有 dshDesktopBoot）里 apply 什么都不注册', () => {
+    // `dshDesktopBoot` 只由 Electron preload 用 contextBridge 注入；有它 = 桌面窗口。
+    const { registrations } = applyAndCollect({ window: { dshDesktopBoot: { ready: async () => ({}) } } })
+    const injects = registrations.filter((r) => r.kind === 'slots.inject')
+    assert.equal(injects.length, 0, '桌面里必须一个插槽都不注入')
+    assert.equal(registrations.length, 0, '桌面里不该产生任何注册动作')
+  })
+
+  it('手机页面（没有 dshDesktopBoot）里照常注册', () => {
+    const { registrations } = applyAndCollect({ window: {} })
+    const injects = registrations.filter((r) => r.kind === 'slots.inject')
+    assert.equal(injects.length, 2, '手机页面上要注册设置行 + 底部图标')
+  })
+
+
 })

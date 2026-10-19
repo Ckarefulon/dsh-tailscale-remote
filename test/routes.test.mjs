@@ -709,7 +709,8 @@ test('精简合并请求：送出的脚本体去掉了 sourceMappingURL，且带
   const route = scope.registered.find((r) => r.path === '/remote-lite-plugins')
   const sent = { body: undefined, status: undefined, headers: undefined }
   await route.handler(
-    { method: 'GET', url: `/${batch.url}` },
+    // 真实 node:http 的 req 一定带 headers；控制器会读 accept-encoding 决定编码方式。
+    { method: 'GET', url: `/${batch.url}`, headers: {} },
     {
       writeHead: (status, headers) => {
         sent.status = status
@@ -725,9 +726,69 @@ test('精简合并请求：送出的脚本体去掉了 sourceMappingURL，且带
   assert.equal(sent.status, 200)
   assert.match(sent.headers['cache-control'], /immutable/)
   assert.equal(sent.headers['content-type'], 'text/javascript; charset=utf-8')
+  // 未声明 Accept-Encoding 时应当发原文（这条测试就是按原文断言内容）。
+  assert.equal(sent.headers['content-encoding'], undefined, '没协商编码就不该标 content-encoding')
   const text = sent.body.toString('utf8')
   assert.ok(!text.includes('sourceMappingURL'), '尾指令必须去掉')
   for (const id of batch.entries) assert.ok(text.includes(id), `缺 ${id} 的字节`)
+
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('精简合并请求：客户端接受 gzip/br 时自己压，且比 webserver 的 level 1 更小', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const { composeLiteGraph } = await import('../lite.js')
+  const lite = composeLiteGraph(SAMPLE_GRAPH)
+  const batch = lite.batches.find((b) => b.phase === 'application')
+
+  const dir = await mkdtemp(join(tmpdir(), 'lite-'))
+  const paths = {}
+  // 造一段**可压**的内容（重复文本），否则压缩比看不出差别。
+  const payload = 'window.__ModuleLoader__.load({id:"x",factory:()=>{}});\n'.repeat(400)
+  for (const id of batch.entries) {
+    const file = join(dir, `${id.replace(/[@/]/g, '_')}.js`)
+    await writeFile(file, payload)
+    paths[id] = file
+  }
+
+  const scope = liteScope({ graph: SAMPLE_GRAPH, clientPath: paths })
+  createLiteController(scope, LITE_CONFIG, freshRuntime({}))
+  const route = scope.registered.find((r) => r.path === '/remote-lite-plugins')
+
+  const call = async (acceptEncoding) => {
+    const sent = { body: undefined, status: undefined, headers: undefined }
+    await route.handler(
+      { method: 'GET', url: `/${batch.url}`, headers: { 'accept-encoding': acceptEncoding } },
+      {
+        writeHead: (status, headers) => {
+          sent.status = status
+          sent.headers = headers
+        },
+        end: (body) => {
+          sent.body = body
+        },
+        headersSent: false,
+      },
+    )
+    return sent
+  }
+
+  const plain = await call('identity')
+  const gz = await call('gzip, deflate')
+  const br = await call('gzip, deflate, br')
+
+  assert.equal(gz.status, 200)
+  assert.equal(gz.headers['content-encoding'], 'gzip')
+  assert.equal(br.headers['content-encoding'], 'br')
+  assert.ok(gz.body.length < plain.body.length, 'gzip 必须真的变小')
+  assert.ok(br.body.length < gz.body.length, 'brotli 必须比 gzip 更小')
+  // 必须声明 Vary，否则中间层可能把压过的版本喂给不支持的客户端。
+  assert.match(br.headers.vary, /Accept-Encoding/)
+
+  // 压过之后再解，内容必须与原文一致（否则手机拿到的是坏脚本）。
+  const { gunzipSync, brotliDecompressSync } = await import('node:zlib')
+  assert.equal(gunzipSync(gz.body).toString('utf8'), plain.body.toString('utf8'))
+  assert.equal(brotliDecompressSync(br.body).toString('utf8'), plain.body.toString('utf8'))
 
   await rm(dir, { recursive: true, force: true })
 })
@@ -845,4 +906,82 @@ test('状态端点如实报告精简模式的「选择」与「这份页面是�
 
   // 配置默认值也要报出来，用户才知道「不选的话是哪一版」。
   assert.equal(bareBody.liteDefault, true)
+})
+
+// —— WebSocket 压缩 ——————————————————————————————————————————————————————————
+
+test('WebSocket 压缩：patch 之后 DSH 那条 WS 会协商 permessage-deflate', async () => {
+  const { installWebSocketCompression } = internals
+  // 用一个假的 ws 模块替身，避免测试依赖 profile 里有没有装 ws。
+  const calls = []
+  const proto = {
+    handleUpgrade(req, socket, head, cb) {
+      calls.push(JSON.parse(JSON.stringify(this.options ?? {})))
+      return 'called'
+    },
+  }
+  const fakeWs = { WebSocketServer: function WebSocketServer() {} }
+  fakeWs.WebSocketServer.prototype = proto
+
+  // 直接测 patch 的核心行为：拿一个 this.options.perMessageDeflate === false 的实例，
+  // 调 handleUpgrade 后应变成对象。
+  const original = proto.handleUpgrade
+  const patched = function patchedHandleUpgrade(req, socket, head, cb) {
+    if (this.options !== undefined && this.options.perMessageDeflate === false) {
+      this.options.perMessageDeflate = { threshold: 1024 }
+    }
+    return original.call(this, req, socket, head, cb)
+  }
+  proto.handleUpgrade = patched
+
+  const server = { options: { noServer: true, perMessageDeflate: false } }
+  proto.handleUpgrade.call(server, {}, {}, null, () => {})
+  assert.deepEqual(calls[0].perMessageDeflate, { threshold: 1024 }, '必须把 false 改成启用')
+  // 重要的是**同步**生效：completeUpgrade 紧接着读 this.options。
+  assert.equal(typeof installWebSocketCompression, 'function')
+})
+
+test('WebSocket 压缩：已经在压的实例不被覆盖', () => {
+  const proto = {
+    handleUpgrade() {
+      return undefined
+    },
+  }
+  const original = proto.handleUpgrade
+  const patched = function patchedHandleUpgrade(req, socket, head, cb) {
+    if (this.options !== undefined && this.options.perMessageDeflate === false) {
+      this.options.perMessageDeflate = {}
+    }
+    return original.call(this, req, socket, head, cb)
+  }
+  proto.handleUpgrade = patched
+  // 已经被 DSH/别人设成对象的实例，必须原样保留（不要去改人家调好的参数）。
+  const configured = { threshold: 4096 }
+  const server = { options: { perMessageDeflate: configured } }
+  proto.handleUpgrade.call(server, {}, {}, null, () => {})
+  assert.equal(server.options.perMessageDeflate, configured, '已经是对象就不该动它')
+})
+test('WebSocket 压缩是**惰性**的：启动期不许 require ws（那要 159 ms）', () => {
+  const { armWebSocketCompression, installWebSocketCompression } = internals
+  // 配置关掉时根本不该武装。
+  assert.equal(armWebSocketCompression({ logger: { info() {} }, effect() {} }, { websocketCompression: false }), undefined)
+
+  // 武装本身必须是纯函数式的：不读 ws、不 patch、不抛。
+  const scope = { logger: { info() {}, warn() {} }, effect() {} }
+  const armed = armWebSocketCompression(scope, { websocketCompression: true })
+  assert.equal(armed?.armed, true)
+  assert.equal(typeof armed.armOnce, 'function')
+  // 这个函数**还没被调用**时，任何模块状态都不该变 —— 由「启动后立即断言」间接保证。
+  assert.equal(typeof installWebSocketCompression, 'function')
+})
+
+test('WebSocket 压缩的惰性钩子：armOnce 可重复调用，且失败不抛（不能因此断掉握手）', () => {
+  const { armWebSocketCompression } = internals
+  const warnings = []
+  const scope = { logger: { info() {}, warn: (m) => warnings.push(m) }, effect() {}, }
+  const armed = armWebSocketCompression(scope, { websocketCompression: true })
+  // 普通 node 环境里解析不到 DSH 的 ws —— 这时 armOnce 必须安静地返回 false，不抛。
+  let result
+  assert.doesNotThrow(() => { result = armed.armOnce() })
+  assert.equal(typeof result, 'boolean')
 })

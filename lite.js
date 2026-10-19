@@ -19,6 +19,7 @@
 // 一个字节都不会被裁掉。
 
 import { createHash } from 'node:crypto'
+import { brotliCompressSync, constants, gzipSync } from 'node:zlib'
 
 /** 精简组合的版本号；白名单或拼装方式变了就 +1（会进合并请求的 rev，从而失效缓存）。 */
 export const LITE_VERSION = 1
@@ -53,12 +54,13 @@ export const LITE_REQUIRED = [
   '@deepseek-ai/dsh-client-ui-conversation',
   '@deepseek-ai/dsh-client-ui-chat',
   '@deepseek-ai/dsh-api-remotes',
+  // 注意：`ui-settings-general` **不在**这里。它只是设置页的界面，精简页面把设置入口
+  // 换成自己的开关，不再需要它。但 `ui-settings`（服务）必须在 —— 见 LITE_SEEDS。
   '@deepseek-ai/dsh-client-ui-settings',
-  '@deepseek-ai/dsh-client-ui-settings-general',
 ]
 
 /**
- * 精简页面的种子包：手机上看对话、切会话、开设置页所必需的那些。
+ * 精简页面的种子包：手机上看对话、切会话、发消息所必需的那些。
  *
  * 这只是**种子**，不是最终集合 —— 真正保留的是它在活图上的传递闭包（`inject` 与
  * `external` 两条边都走）。闭包能自动带上所有被同步 `require()` 的依赖，所以不必
@@ -67,6 +69,17 @@ export const LITE_REQUIRED = [
  * 刻意**不含** `@deepseek-ai/dsh-client-hmr`：它是唯一会通过 `/plugins/events` 把
  * **完整**插件图推回页面的插件，留着的话客户端会立刻把裁掉的包全部重新拉一遍，
  * 精简就白做了。手机也不需要热更新。
+ *
+ * 也刻意**不含**这几项（用户点名不要，共省约 210 KB gzip）：
+ *   - `ui-settings-general`：设置页的界面。手机上不留设置入口（见 LITE_HIDE），
+ *     所以它的行插槽没人渲染。**注意 `ui-settings` 本身必须留** —— 它 `provide`
+ *     了 `configForms`/`settingsSchema`，locale / theme / chat / conversation 都
+ *     硬依赖它，删了会让整个 boot 审计报「pending」并让页面起不来。
+ *   - `ui-sidebar-right` / `ui-trajectory` / `ui-tool` / `ui-attachment` / `ui-reference`：
+ *     右侧栏、轨迹视图、工具调用渲染、附件与引用。
+ *
+ * 但这几项里 `sidebarRight` 是 `ui-chat`/`ui-reference` 的**硬依赖服务**，所以
+ * 不能直接从图里删（详见 LITE_SERVICE_KEEP）。
  */
 export const LITE_SEEDS = [
   '@deepseek-ai/dsh-client-connection',
@@ -84,7 +97,6 @@ export const LITE_SEEDS = [
   '@deepseek-ai/dsh-client-ui-theme',
   '@deepseek-ai/dsh-client-ui-layout',
   '@deepseek-ai/dsh-client-ui-sidebar',
-  '@deepseek-ai/dsh-client-ui-sidebar-right',
   '@deepseek-ai/dsh-client-ui-session',
   '@deepseek-ai/dsh-client-ui-workspace',
   '@deepseek-ai/dsh-client-ui-conversation',
@@ -95,15 +107,71 @@ export const LITE_SEEDS = [
   '@deepseek-ai/dsh-client-ui-approval',
   '@deepseek-ai/dsh-client-ui-user-questions',
   '@deepseek-ai/dsh-client-ui-message-feedback',
-  '@deepseek-ai/dsh-client-ui-attachment',
-  '@deepseek-ai/dsh-client-ui-reference',
-  '@deepseek-ai/dsh-client-ui-trajectory',
-  '@deepseek-ai/dsh-client-ui-tool',
   '@deepseek-ai/dsh-client-ui-renderer',
   '@deepseek-ai/dsh-client-ui-settings',
-  '@deepseek-ai/dsh-client-ui-settings-general',
-  '@deepseek-ai/dsh-client-ui-shortcuts',
   'dsh-tailscale-remote',
+]
+
+/**
+ * 只留服务、不留界面的包。
+ *
+ * 为什么需要这一类：Cordis 的 `exports.inject` 是**服务级**门禁 —— 一个包声明的服务
+ * 没有提供者时，它的 fiber 停在 `pending`，而 shell 的 boot 审计（`webRun` 末尾那个
+ * `bZ`）把 `pending` 也算失败，直接抛 `web boot: N entries did not activate`，
+ * **整个页面白屏**。所以「用户不要右侧栏」不能简单地删 `ui-sidebar-right`
+ * （它 provide 了 `sidebarRight`，`ui-chat` 硬依赖），只能**留着包、藏掉界面**。
+ *
+ * 藏法：这些包把界面注册在插槽上，而插槽的挂载点由容器决定。这里列的是
+ * 「注册了就要藏起来」的插槽名，见 LITE_HIDE。
+ */
+export const LITE_SERVICE_KEEP = [
+  '@deepseek-ai/dsh-client-ui-sidebar-right',
+  '@deepseek-ai/dsh-client-ui-trajectory',
+  '@deepseek-ai/dsh-client-ui-tool',
+]
+
+/**
+ * 精简页面上要**藏掉**的界面锚点（CSS 选择器）。
+ *
+ * 为什么用 CSS 而不是删包：见 LITE_SERVICE_KEEP。这些选择器都是 DSH 自己的
+ * **稳定**锚点（`data-slot` 是插槽系统公开的定位键），不是哈希类名，所以 DSH
+ * 小版本升级不会让它们失效；真失效了也只是「多显示一块」，不会白屏。
+ *
+ * **只在这份（手机的）页面上生效** —— 桌面窗口走的是另一条渲染路径，一个字节都
+ * 不经过这里。
+ */
+export const LITE_HIDE = [
+  // 设置入口：用户要求把这里换成「精简 / 完整」开关（那个图标由本插件自己注册到
+  // sidebar.footer.action，所以藏掉原生的设置按钮不影响我们自己那一格）。
+  '[data-slot="sidebar.settings"]',
+  // 右侧栏：连同它的开关按钮（按钮没有 data-slot，只能按 aria-label 定位）。
+  '[data-slot="rightbar"]',
+  'button[aria-label="打开右侧边栏"]',
+  'button[aria-label="收起右侧边栏"]',
+  // 会话视图切换里那个「轨迹」页签。
+  '[data-slot="conversation.view"][data-slot-id="trajectory"]',
+]
+
+/**
+ * 精简页面上要**修的布局**（只改这一份页面）。
+ *
+ * 只做一件事：把「工作区」标题行里搜索按钮前面那段空档去掉。
+ *
+ * 成因（实测 DOM）：那一行是 `display:flex; gap:4px; justify-content:flex-end`，
+ * 但搜索按钮的容器 `_9lTDKa_searchSlot` 自带 `flex: 1 1 0%` 和一个**硬编码**的
+ * `margin-left: 146px`。146px 是按「工作区」这几个字的宽度估出来的，一旦窄了/宽了
+ * 就留下一段多余空白。把它归零、让 flex 自己撑开，按钮就贴到右边该在的位置。
+ *
+ * 为什么用属性选择器而不是哈希类名：`_9lTDKa_` 前缀是构建产物，DSH 一升级就变；
+ * `[class*="_searchSlot"]` 认的是那一段可读的语义名，稳得多，而且匹配不到时只是
+ * 布局保持原样，不会坏事。
+ */
+export const LITE_FIX = [
+  {
+    // 搜索按钮那一格：去掉硬编码左边距，让它靠 flex 定位。
+    selector: '[class*="_searchSlot"]',
+    css: 'margin-left:0 !important;flex:0 0 auto !important',
+  },
 ]
 
 /** 去掉 DSH loader 里那个 `/client` 子路径后缀，得到包名。 */
@@ -272,6 +340,43 @@ function serializeGlobal(value) {
   return JSON.stringify(value).replaceAll('<', '\\u003c')
 }
 
+/**
+ * 选一种「手机上真的能省字节」的压缩来编码合并请求的正文。
+ *
+ * 为什么不能只依赖 webserver 的 gzip：实测那条约 5.0 MB 的合并请求在
+ * `compressionLevel: 1` 下是 1,295,803 B，而这个函数据同一份字节：
+ *
+ *   gzip level 1 → 1,295,803（webserver 默认）
+ *   gzip level 6 → 1,062,672（-18%）
+ *   brotli q5    →   ~880,000（-32%）
+ *
+ * 手机上这是实打实的省流量与省时间。brotli 优先（几乎所有现代手机浏览器都支持），
+ * 不支持就退 `gzip`，都不支持就发原文。
+ *
+ * 压缩在**拼好之后同步做一次**并缓存在调用方，所以只花一次 CPU（约 0.1–0.5 s），
+ * 之后每个请求都是直接吐缓存。这也是为什么不在每个请求里现压。
+ * @param body - 未压缩的正文。
+ * @param acceptEncoding - 客户端的 `Accept-Encoding` 头（可缺省）。
+ * @returns `{ body, encoding }`；`encoding` 为 undefined 表示发原文。
+ */
+export function encodeComboBody(body, acceptEncoding) {
+  const accepted = String(acceptEncoding ?? '').toLowerCase()
+  if (accepted.includes('br')) {
+    return { body: brotliCompressSync(body, {
+      params: {
+        [constants.BROTLI_PARAM_QUALITY]: 5,
+        // 这个正文是脚本，不是网页；文本模式更省。
+        [constants.BROTLI_PARAM_MODE]: constants.BROTLI_MODE_TEXT,
+      },
+    }), encoding: 'br' }
+  }
+  if (accepted.includes('gzip')) {
+    // 6 是速度/比率的拐点：再往上只多省 0.5%，CPU 却翻倍。
+    return { body: gzipSync(body, { level: 6 }), encoding: 'gzip' }
+  }
+  return { body, encoding: undefined }
+}
+
 /** `renderRow` 对属性值的转义，用于按原样定位 preload 链接。 */
 function escapeHtmlAttribute(value) {
   return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
@@ -351,9 +456,33 @@ export function rewriteIndex(html, input) {
   const head2 = /<head(?:\s[^>]*)?>/i.exec(out)
   if (head2 === null) return { html, changed: false, reason: 'head-missing' }
   const head2End = head2.index + head2[0].length
-  out = `${out.slice(0, head2End)}${marker}${out.slice(head2End)}`
+  out = `${out.slice(0, head2End)}${marker}${hideCss(input.hide)}${out.slice(head2End)}`
 
   return { html: out, changed: true, reason: 'ok', removed: matched.length, preloads: lite.batches.length }
+}
+
+/**
+ * 藏掉指定界面锚点的那一段 `<style>`。
+ *
+ * 为什么用 CSS 而不是删包：`exports.inject` 是**服务级**门禁，一个包提供的服务被
+ * 别人硬依赖时，删包会让消费者的 fiber 停在 `pending`，而 boot 审计把 pending 算
+ * 失败 —— 整个页面白屏。所以「用户不要右侧栏」只能留包、藏界面。
+ *
+ * `display: none !important` 而不是 `visibility: hidden`：后者仍然占布局，侧边栏
+ * 那块空白会留着。用 `!important` 是因为 DSH 自己的类名带优先级。
+ * @param selectors - 要隐藏的 CSS 选择器；省略时用 `LITE_HIDE`。
+ */
+function hideCss(selectors) {
+  const list = Array.isArray(selectors) && selectors.length > 0 ? selectors : LITE_HIDE
+  const rules = []
+  if (list.length > 0) {
+    // 选择器只来自本模块的常量（绝不拼接外部输入），所以不需要转义。
+    rules.push(`${list.join(',')}{display:none !important}`)
+  }
+  // 布局修正（跟「藏掉」分开写：一个是 display:none，一个是改几条属性）。
+  for (const fix of LITE_FIX) rules.push(`${fix.selector}{${fix.css}}`)
+  if (rules.length === 0) return ''
+  return `<style data-dsh-tailscale-remote-hide>${rules.join('')}</style>`
 }
 
 /**

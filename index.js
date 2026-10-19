@@ -26,10 +26,11 @@ import { spawn } from 'node:child_process'
 import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { LITE_ROUTE, composeComboBody, composeLiteGraph, matchLiteRequest, rewriteIndex } from './lite.js'
+import { LITE_HIDE, LITE_ROUTE, composeComboBody, composeLiteGraph, encodeComboBody, matchLiteRequest, rewriteIndex } from './lite.js'
 
 /** 稳定插件名。 */
 export const name = 'dsh-tailscale-remote'
@@ -123,6 +124,11 @@ function normalizeConfig(raw) {
     // 精简模式的种子包（不填就用 lite.js 里那份默认白名单）。
     // 只在「DSH 升级后默认白名单失配、又想自己补几个包」时才需要。
     liteSeeds: Array.isArray(source.liteSeeds) ? source.liteSeeds.filter((id) => typeof id === 'string') : undefined,
+    // 精简页面上要藏掉的界面锚点（CSS 选择器）。不填就用 lite.js 的 LITE_HIDE。
+    liteHide: Array.isArray(source.liteHide) ? source.liteHide.filter((s) => typeof s === 'string') : undefined,
+    // 给 DSH 的 WebSocket（`/api/remote.mux`，会话历史走它）开 permessage-deflate。
+    // 这是「手机拉会话历史慢」的主因：那条 WS 默认完全不压缩。
+    websocketCompression: source.websocketCompression !== false,
   }
 }
 
@@ -464,6 +470,143 @@ const ROTATE_PATH = '/api/dsh-tailscale-remote/rotate'
 const LITE_PATH = '/api/dsh-tailscale-remote/lite'
 
 /**
+ * 惰性版：启动期**什么都不做**，只在手机的 WebSocket 真的开始握手时才付出代价。
+ *
+ * 为什么必须惰性：`require('ws')` 要从 `app.asar` 里读并编译，实测 **159 ms**。
+ * 那笔钱花在 DSH 启动路径上就是「插件拖慢了启动」，而用户明确不许。所以这里只挂
+ * 一个一次性钩子：等 `/api/remote.mux` 的第一条 upgrade 请求路过时，再在那条请求
+ * 里做 patch（此时进程已经起来了，150 ms 落在手机那条连接上，不影响桌面）。
+ *
+ * 挂哪：`webServer.registerUpgrade` 拿不到（DSH 的 gateway 已经占了那个 path，重复
+ * 注册会抛），所以改成监听 `http.Server` 的 `upgrade` 事件。`ws` 的 `noServer` 模式
+ * 下，DSH 自己也是靠 `server.on('upgrade')` 把请求交给 `handleUpgrade` 的，所以我们的
+ * listener 一定会先于/晚于它跑一次 —— 但只要在**同一个 tick 内** patch 好 prototype，
+ * 同步执行的 `handleUpgrade` 就一定能看到新 options。
+ *
+ * 具体做法：`prependListener` 把一个**只做 patch、不消费请求**的 listener 插到最前，
+ * 它就地把 prototype 换好，然后原样让事件继续流向 DSH 的 listener。
+ * @param scope - 插件上下文。
+ * @param config - 归一化配置。
+ * @returns `{ armed }` 或 undefined（配置关掉时）。
+ */
+function armWebSocketCompression(scope, config) {
+  if (!config.websocketCompression) return undefined
+  return {
+    armed: true,
+    /**
+     * 第一次握手时调用一次；之后是 no-op。
+     * @returns 是否真的 patch 成功。
+     */
+    armOnce() {
+      const result = installWebSocketCompression(scope, config)
+      return result?.enabled === true
+    },
+  }
+}
+
+/**
+ * 拿到 **DSH 自己用的那一个** `ws` 模块。
+ *
+ * 为什么不能 `createRequire(import.meta.url)('ws')`：实测在 DSH 运行时里那是
+ * `MODULE_NOT_FOUND` —— profile 的 `node_modules` 里没有 `ws`，它在 `app.asar` 的
+ * `dsh/node_modules` 下。而**只有**拿到同一个模块实例，对 prototype 的 patch 才会
+ * 作用到 DSH 已经建好的那个 `WebSocketServer`（同一个对象，prototype 共享）。
+ *
+ * 做法：沿 DSH 的包路径找几个锚点，从那里 `createRequire` 解析。`app.asar` 里的
+ * 路径对 Node 是普通路径（Electron 的 asar 层负责读），所以 `createRequire` 直接可用。
+ *
+ * 全部失败就返回 undefined（调用方静默跳过；不开压缩但功能完全正常）。
+ * @returns `ws` 模块，或 undefined。
+ */
+function resolveHostWebSocket() {
+  const anchors = []
+  // 1) 最可靠：从**正在运行的那个 DSH 的 app 根**出发。宿主进程里 `process.execPath`
+  //    指向 Electron/Node 可执行文件，`process.resourcesPath` 在 Electron 下就是
+  //    resources 目录（asar 所在处）。
+  const resources = process.resourcesPath
+  if (typeof resources === 'string' && resources !== '') {
+    anchors.push(join(resources, 'app.asar', 'dsh', 'index.js'))
+    anchors.push(join(resources, 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-api-gateway', 'lib', 'index.js'))
+  }
+  // 2) 兜底：直接从本模块往上找 `@deepseek-ai/dsh-*`（有些部署是解包安装的）。
+  anchors.push(import.meta.url)
+
+  for (const anchor of anchors) {
+    try {
+      const ws = createRequire(anchor)('ws')
+      if (ws?.WebSocketServer?.prototype !== undefined) return ws
+    } catch {
+      // 这个锚点不行，试下一个。
+    }
+  }
+  return undefined
+}
+
+/**
+ * 给 DSH 那条 WebSocket 打开 `permessage-deflate` 压缩。
+ *
+ * 这是「手机中途连接很慢」的最大一项：会话历史/事件全部走 `/api/remote.mux`，
+ * 而 DSH 用 `new WebSocketServer({ noServer: true })` 建它，`ws` 的默认
+ * `perMessageDeflate: false` 意味着**完全不压**。实测一个会话的界面只有约 12 KB
+ * 文字，同一时刻这条 WS 的下行却有 22.5 MB —— 这些 JSON 高度重复，压缩率通常
+ * 在 5–15 倍，对窄带手机是决定性的。
+ *
+ * 实现上只 patch `handleUpgrade`：`ws` 在它内部**同步**调用 `completeUpgrade()`，
+ * 而后者用 `this.options` 构造 `WebSocket`，所以在这里把 `this.options.perMessageDeflate`
+ * 打开一定生效，没有竞态。
+ *
+ * 为什么这个 patch 能作用到 DSH 已有的 mux：宿主进程里插件与 DSH 解析到的是同一个
+ * `ws` 模块实例（实测严格相等），prototype 是共享的。
+ *
+ * 一切失败都**静默降级**（只是不开压缩，功能不变），绝不影响启动。
+ * @param scope - 插件上下文（用来挂 disposer 与日志）。
+ * @param config - 归一化配置（`websocketCompression` 关掉就完全不动）。
+ * @returns `{ enabled }`；跳过时返回 undefined。
+ */
+function installWebSocketCompression(scope, config) {
+  if (!config.websocketCompression) return undefined
+  // 关键：**不能**从本模块位置解析 `ws` —— 实测在 DSH 运行时里那是 MODULE_NOT_FOUND
+  // （profile 的 node_modules 里没有 `ws`，它在 app.asar 里）。必须借用 DSH 自己的
+  // 模块图，见 resolveHostWebSocket。
+  const ws = resolveHostWebSocket()
+  if (ws === undefined) return undefined
+  const proto = ws?.WebSocketServer?.prototype
+  if (proto === undefined || typeof proto.handleUpgrade !== 'function') return undefined
+  // 已经打过（重复加载）就别重复包。
+  if (proto.handleUpgrade.__dshTailscaleRemotePatched === true) {
+    return { enabled: true, alreadyPatched: true }
+  }
+
+  const original = proto.handleUpgrade
+  const patched = function patchedHandleUpgrade(req, socket, head, callback) {
+    // 只在**服务端**补齐默认值；`ws` 自己的构造函数会把 `true` 规范化成 `{}`。
+    if (this.options !== undefined && this.options.perMessageDeflate === false) {
+      this.options.perMessageDeflate = {
+        // 阈值与窗口都取保守值：手机内存和 CPU 都有限，选太大的窗口反而拖慢首包。
+        threshold: 1024,
+        // 只压服务端 → 客户端的下行（会话事件几乎全在这个方向）；
+        // 客户端 → 服务端的输入很小，压它只白白多花 CPU。
+        serverNoContextTakeover: true,
+        clientNoContextTakeover: true,
+      }
+    }
+    return original.call(this, req, socket, head, callback)
+  }
+  patched.__dshTailscaleRemotePatched = true
+  proto.handleUpgrade = patched
+
+  scope.effect(
+    () => () => {
+      // 拆插件时还原，避免留下一个已经没人负责的 patch。
+      if (proto.handleUpgrade === patched) proto.handleUpgrade = original
+    },
+    'tailscale-remote: websocket compression',
+  )
+  scope.logger.info('tailscale-remote: 已为 DSH 的 WebSocket 开启 permessage-deflate（手机拉会话历史会快很多）')
+  return { enabled: true }
+}
+
+/**
  * 精简模式：把 HTTP 渲染出来的那份页面裁小。
  *
  * 为什么整条路都挂在 `webServer` + `clientModules` 上，而不是改 DSH：DSH 的宿主半边
@@ -499,6 +642,8 @@ function createLiteController(scope, config, runtime) {
   const logger = scope.logger
   /** 内核字节缓存：包名 → Buffer。合并请求每次都会重新拼，但读盘只读一次。 */
   const bundleCache = new Map()
+  /** 压好的合并正文缓存：`包名+rev+编码` → `{ body, encoding, rawBytes }`。 */
+  const comboCache = new Map()
 
   /**
    * 用**当前**的整图重算一次精简图。
@@ -529,6 +674,31 @@ function createLiteController(scope, config, runtime) {
     }
   }
 
+  /**
+   * 把一个合并请求的正文压好并缓存。
+   *
+   * 缓存键是「包名 + 各自的 rev + 协商到的编码」：rev 变了 URL 就变了，所以旧条目
+   * 永远不会被错误命中，也就不需要失效逻辑。缓存值同时记住未压缩大小，方便状态端点
+   * 报出真实节省。
+   *
+   * 为什么缓存：brotli q5 压这 5 MB 要约 0.1–0.5 s。不缓存的话每次刷新手机都要等
+   * 这段时间；缓存之后只有第一次付出。
+   * @param ids - 该段的包名（有序）。
+   * @param buffers - 与之对应的原始字节。
+   * @param acceptEncoding - 客户端的 `Accept-Encoding`。
+   * @returns `{ body, encoding }`。
+   */
+  const encodeCombo = async (ids, buffers, acceptEncoding) => {
+    const key = `${ids.join(',')}|${String(acceptEncoding ?? '')}`
+    const cached = comboCache.get(key)
+    if (cached !== undefined) return cached
+    const raw = composeComboBody(buffers)
+    const encoded = encodeComboBody(raw, acceptEncoding)
+    const record = { ...encoded, rawBytes: raw.length }
+    comboCache.set(key, record)
+    return record
+  }
+
   /** 精简合并请求：`<路由>/??<包名>/client.js,...&rev=<rev>`。 */
   const serveLiteBundle = async (req, res) => {
     const url = req.url ?? '/'
@@ -551,12 +721,84 @@ function createLiteController(scope, config, runtime) {
       }
       buffers.push(bytes)
     }
+    // 正文自己压：webserver 的 gzip 是 level 1（实测 1,295,803 B），而同一份字节用
+    // brotli q5 只要约 880 KB、gzip level 6 要 1,062,672 B。手机走 tailnet 时这是
+    // 实打实的省流量和省时间，所以这里自己压并把结果缓存住（只算一次，不是每请求）。
+    const encoded = await encodeCombo(batch.entries, buffers, req.headers['accept-encoding'])
     res.writeHead(200, {
       'content-type': 'text/javascript; charset=utf-8',
       // 与 client-modules 自己的合并请求同口径：rev 变了 URL 就变，所以可以长期缓存。
       'cache-control': 'public, max-age=31536000, immutable',
+      ...(encoded.encoding === undefined ? {} : { 'content-encoding': encoded.encoding }),
+      // 别让 webserver 的 compression 再套一层（它会看 Content-Encoding 跳过）。
+      vary: 'Accept-Encoding',
     })
-    res.end(req.method === 'HEAD' ? undefined : composeComboBody(buffers))
+    res.end(req.method === 'HEAD' ? undefined : encoded.body)
+  }
+
+  // 让 DSH 那条 WebSocket（`/api/remote.mux`）**开启压缩**。
+  //
+  // 这是「手机上载入会话历史很慢、甚至载不出来」的真正主因：会话历史不走 HTTP，
+  // 走的是这条 WS；而 DSH 建 mux 时用的是 `new WebSocketServer({ noServer: true })`，
+  // `ws` 的默认值是 `perMessageDeflate: false` —— 实测握手响应里**根本没有**
+  // `sec-websocket-extensions`，也就是说那几十 MB 的会话事件是**明文 JSON**过的。
+  // 一个真实会话的 `bodyLen` 约 12 KB 的界面，背后收进了 22.5 MB 的下行文本。
+  //
+  // 做法：patch `ws.WebSocketServer.prototype.handleUpgrade`，让它在读完握手头之后、
+  // 真正建 socket 之前把 `this.options.perMessageDeflate` 打开。为什么在这个位置：
+  // `completeUpgrade()` 是**同步**用 `this.options` 构造 `WebSocket` 的，所以在
+  // `handleUpgrade` 里改 `this.options` 一定生效（没有竞态）。
+  //
+  // 为什么能拿到同一个 `ws`：宿主进程里 DSH 与插件解析到的是**同一个**模块实例
+  // （实测两次 `require('ws')` 严格相等），所以 prototype 上的改动对 DSH 自己已经
+  // 建好的那个 mux 也生效 —— 不用重建、不用重启、不碰 DSH 一行代码。
+  //
+  // 风险控制：拿不到 `ws`、或 prototype 已经不是预期形状，就**静默跳过**（只是没开
+  // 压缩，功能完全不受影响）；绝不因为这条路失败而影响启动。
+  //
+  // **惰性**：这里只是登记一个「等第一条握手路过时再动手」的钩子，启动期**不**
+  // `require('ws')`（实测那次 require 要 159 ms，会让桌面端启动变慢）。真正的 patch
+  // 发生在下一次 WS 握手时，那一次握手本身要几毫秒，多出来的代价放在手机上、
+  // 而不是你的启动路径上。见 armWebSocketCompression。
+  let websocketPatch = armWebSocketCompression(scope, config)
+
+  // 惰性触发器：等第一条 WS upgrade 路过时，就地把 `ws` 的 handleUpgrade patch 好。
+  //
+  // `prependListener` + 不消费事件 = 只观察不干预：DSH 自己那个 listener 照常收到
+  // 事件、照常完成握手。patch 必须在同一次 `emit('upgrade')` 的同步链里完成，因为
+  // `ws` 的 `handleUpgrade` 也是同步读 `this.options` 的 —— prepend 保证了顺序。
+  //
+  // 每一步失败都吞掉：压缩没开不影响任何功能，但绝不能让一条 upgrade 因为我们的
+  // hook 抛错而断掉（那会让手机连不上）。
+  if (websocketPatch !== undefined) {
+    const raw = webServer.server
+    if (raw !== undefined && typeof raw.prependListener === 'function') {
+      const onUpgrade = () => {
+        try {
+          websocketPatch.armOnce()
+        } catch (error) {
+          scope.logger.warn(`tailscale-remote: 开启 WebSocket 压缩失败（不影响使用）：${error?.message ?? error}`)
+        } finally {
+          // 一次性：patch 之后再没有意义，摘掉避免每次握手都走一遍。
+          raw.removeListener('upgrade', onUpgrade)
+        }
+      }
+      raw.prependListener('upgrade', onUpgrade)
+      scope.effect(
+        () => () => {
+          try {
+            raw.removeListener('upgrade', onUpgrade)
+          } catch {
+            /* 拆插件时 server 可能已经关了，无所谓 */
+          }
+        },
+        'tailscale-remote: websocket compression trigger',
+      )
+    } else {
+      // 拿不到底层 server（未来的 DSH 改了装配方式）：退回启动期直接 patch。
+      // 这条退路会让启动慢 159 ms，所以只在真拿不到时走。
+      websocketPatch = installWebSocketCompression(scope, config)
+    }
   }
 
   // index 改写。**只碰渲染结果**，不碰 DSH 的任何服务状态。
@@ -572,12 +814,20 @@ function createLiteController(scope, config, runtime) {
           warnLiteUnavailable('seed-mismatch')
           return html
         }
-        const result = rewriteIndex(html, { lite })
+        const result = rewriteIndex(html, { lite, hide: config.liteHide ?? LITE_HIDE })
         if (!result.changed) {
           warnLiteUnavailable(result.reason)
           return html
         }
-        runtime.lite = { ids: lite.ids, removed: result.removed, preloads: result.preloads }
+        runtime.lite = {
+          ids: lite.ids,
+          removed: result.removed,
+          preloads: result.preloads,
+          // 压缩是**惰性**挂上的：这里只报「有没有武装」，不触发它。
+          compress: websocketPatch === undefined ? undefined : 'websocket',
+          rawBytes: comboCache.get([...comboCache.keys()][0])?.rawBytes,
+          wireBytes: [...comboCache.values()][0]?.body?.length,
+        }
         return result.html
       }),
     'tailscale-remote: lite index',
@@ -1401,6 +1651,8 @@ export const internals = {
   hostAuthority,
   registerAdminRoutes,
   createLiteController,
+  installWebSocketCompression,
+  armWebSocketCompression,
   persistLiteChoice,
   freshRuntime,
   setup,

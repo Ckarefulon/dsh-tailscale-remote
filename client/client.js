@@ -69,18 +69,8 @@ window.__ModuleLoader__.load({
 			phaseStarting: '还在启动中（拉起 Tailscale / 建立 Serve 路由）。',
 			phaseUnavailable: 'Tailscale 没在运行，远程访问暂时不可用。',
 			phaseError: '远程访问没能建起来。',
-			liteTitle: '精简模式',
-			liteDescription: '手机打开的那个页面只加载最基础的插件，体积从约 5 MB 降到约 1.3 MB。桌面上这个窗口不受任何影响。',
-			liteOn: '已开启',
-			liteOff: '已关闭',
-			liteEnable: '开启精简模式',
-			liteDisable: '关闭精简模式',
-			liteReloadHint: '已保存。刷新手机上的页面后生效。',
-			liteFullHint: '已关闭精简。刷新手机上的页面后生效，届时会加载全部插件。',
-			liteUnavailable: '这条 DSH 上没有 Web 页面渲染路径，精简模式不可用（桌面端本来就只发完整版）。',
-			litePage: (count) => `当前这份页面是精简版，共 ${count} 个插件。`,
-			litePageFull: '当前这份页面是完整版（所有插件）。',
-			liteFailed: '切换失败',
+			liteEnable: '切换到完整版（加载全部插件），刷新后生效',
+			liteDisable: '切换到精简版（只加载基础插件），刷新后生效',
 		}
 
 		const EN = {
@@ -107,18 +97,8 @@ window.__ModuleLoader__.load({
 			phaseStarting: 'Still starting up (bringing up Tailscale / the Serve route).',
 			phaseUnavailable: 'Tailscale is not running, so remote access is unavailable.',
 			phaseError: 'Remote access could not be established.',
-			liteTitle: 'Lite mode',
-			liteDescription: 'The page a phone opens loads only the essential plugins — about 1.3 MB instead of about 5 MB. This desktop window is not affected at all.',
-			liteOn: 'On',
-			liteOff: 'Off',
-			liteEnable: 'Enable lite mode',
-			liteDisable: 'Disable lite mode',
-			liteReloadHint: 'Saved. It applies after reloading the page on your phone.',
-			liteFullHint: 'Lite mode is off. It applies after reloading the page on your phone, which then loads every plugin.',
-			liteUnavailable: 'This DSH has no Web page rendering path, so lite mode is unavailable (the desktop app always sends the full set anyway).',
-			litePage: (count) => `This page is the lite version, with ${count} plugins.`,
-			litePageFull: 'This page is the full version (every plugin).',
-			liteFailed: 'Switch failed',
+			liteEnable: 'Switch to full (load every plugin); applies after reloading',
+			liteDisable: 'Switch to lite (essential plugins only); applies after reloading',
 		}
 
 		/**
@@ -199,6 +179,21 @@ window.__ModuleLoader__.load({
 				color: '#fff',
 			},
 			hint: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary,#6b7280)' },
+			// 侧边栏底部那个图标按钮：28px 见方，与宿主自己那几个图标按钮同尺寸同重量。
+			iconButton: {
+				display: 'flex',
+				alignItems: 'center',
+				justifyContent: 'center',
+				width: 28,
+				height: 28,
+				padding: 0,
+				border: 'none',
+				borderRadius: 'var(--dsw-radius-sm,8px)',
+				background: 'transparent',
+				color: 'var(--dsw-alias-label-secondary,#6b7280)',
+				cursor: 'pointer',
+				flex: 'none',
+			},
 			liteBox: {
 				display: 'flex',
 				flexDirection: 'column',
@@ -266,7 +261,6 @@ window.__ModuleLoader__.load({
 			const [copied, setCopied] = useState(false)
 			const [confirming, setConfirming] = useState(false)
 			const [notice, setNotice] = useState(null)
-			const [liteBusy, setLiteBusy] = useState(false)
 			const inputRef = useRef(null)
 
 			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
@@ -350,32 +344,6 @@ window.__ModuleLoader__.load({
 
 			const canRotate = state !== null && state.canRotate === true && !busy
 
-			/**
-			 * 切换精简模式。
-			 *
-			 * 走服务端（不是 localStorage）：这个开关决定的是**宿主下一次渲染 index 时
-			 * 发哪一版页面**，必须让宿主知道。写完就地更新本地状态，于是按钮立刻反映
-			 * 新选择；页面本身要等刷新才会变，所以提示文案必须说清这一点 ——
-			 * 否则用户切完发现「没什么变化」，会以为按钮坏了。
-			 */
-			const toggleLite = useCallback(async () => {
-				if (state === null) return
-				const next = state.lite !== true
-				setLiteBusy(true)
-				setNotice(null)
-				const result = await readJson(LITE_PATH, {
-					method: 'POST',
-					headers: { 'content-type': 'application/json' },
-					body: JSON.stringify({ enabled: next }),
-				})
-				setLiteBusy(false)
-				if (!result.ok) {
-					setNotice(`${t.liteFailed}：${result.error}`)
-					return
-				}
-				setState((previous) => ({ ...(previous ?? {}), lite: result.data.lite }))
-				setNotice(result.data.lite ? t.liteReloadHint : t.liteFullHint)
-			}, [state, t])
 			// 文案必须跟着实际行为走：吊销会话时警告要说清「所有设备都会退出」，
 			// 否则用户以为只是换个链接，结果手机被踢下线、还不知道为什么。
 			const revokes = state !== null && state.revokesSessions === true
@@ -402,49 +370,8 @@ window.__ModuleLoader__.load({
 			 * 后者是拿数字当契约，DSH 一升级就骗人。标记只说明这一份页面是不是精简版，
 			 * 与整图长什么样无关。拿不到标记（桌面端、或完整版页面）时为 undefined。
 			 */
-			const litePage =
+			const thisPageIsLite =
 				typeof globalThis !== 'undefined' && globalThis.__DSH_TAILSCALE_REMOTE_LITE__ === 'lite'
-					? (state?.liteCount ?? undefined)
-					: undefined
-
-			/**
-			 * 精简模式那一段。
-			 *
-			 * `liteAvailable === false` 时（桌面端 / 没有 Web 渲染路径）整段不显示：
-			 * 摆一个永远点不动的开关只会让人以为插件坏了。
-			 */
-			const liteBlock =
-				state === null || state.liteAvailable !== true
-					? null
-					: h(
-							'div',
-							{ style: styles.liteBox, 'data-dsh-tailscale-remote-lite': '' },
-							h(
-								'div',
-								{ style: styles.head },
-								h(
-									'div',
-									null,
-									h('div', { style: styles.label }, `${t.liteTitle}${state.lite === true ? ` · ${t.liteOn}` : ` · ${t.liteOff}`}`),
-									h('div', { style: styles.description }, t.liteDescription),
-									h(
-										'div',
-										{ style: styles.hint },
-										litePage === undefined ? t.litePageFull : t.litePage(litePage),
-									),
-								),
-								h(
-									'button',
-									{
-										type: 'button',
-										style: styles.button,
-										disabled: liteBusy,
-										onClick: () => void toggleLite(),
-									},
-									state.lite === true ? t.liteDisable : t.liteEnable,
-								),
-							),
-						)
 
 			return h(
 				'div',
@@ -541,18 +468,147 @@ window.__ModuleLoader__.load({
 							usesLoginUrl ? `${t.keepBookmark}${t.cookieHint(state?.cookieMaxAgeDays ?? 0)}` : t.noLogin,
 						)
 					: h('div', { style: styles.hint }, hint),
-				liteBlock,
 			)
 		}
 
 		/**
-		 * 注册这一行。
+		 * 这个页面是不是**桌面 App 窗口**。
 		 *
-		 * `slots.inject` 而不是 `slots.register` 直调：`settings.general.item` 由
-		 * ui-settings-general 声明，它和本包的激活顺序没有保证。
+		 * 判据是 Electron preload 暴露的 `dshDesktopBoot` —— 它只由
+		 * `preload-app.cjs` 用 `contextBridge.exposeInMainWorld` 注入，只有桌面窗口里有；
+		 * 手机浏览器走 HTTP、没有 preload，所以这个字段不存在。
+		 *
+		 * 为什么必须判它：用户要求「电脑端一个字节都不准动」。本插件在桌面窗口里
+		 * **什么都不注册**（既没有设置页那一行、也没有底部这个图标），因此桌面上
+		 * 看到的 DSH 与没装这个插件时完全一致。
+		 *
+		 * 注意用 `in globalThis` 而不是 `typeof x !== 'undefined'`：后者对未声明标识符
+		 * 静默返回 'undefined' 且不报错，是这类判断最容易踩的坑。
+		 */
+		function isDesktopWindow() {
+			return typeof globalThis !== 'undefined' && 'dshDesktopBoot' in globalThis
+		}
+
+		/**
+		 * 精简模式图标。
+		 *
+		 * 图形：16×16 的双向箭头（⇄），代表「在精简 / 完整之间切换」。画法照 DSH 的
+		 * 图标规范：`viewBox="0 0 16 16"`、`fill="none"`、`strokeWidth` 放在 `<svg>` 上、
+		 * 每条 path 上写 `stroke="currentColor"`、`aria-hidden="true"`。
+		 *
+		 * 用户明确要求这一处**用图标**、不要文字按钮；所以无障碍文字走 `aria-label`
+		 * 与 `title`（原生 tooltip），不额外自建气泡。
+		 * @param props - `{ size, strokeWidth }`。
+		 */
+		function LiteSwitchIcon(props) {
+			const size = props?.size ?? 16
+			return h(
+				'svg',
+				{
+					width: size,
+					height: size,
+					viewBox: '0 0 16 16',
+					fill: 'none',
+					xmlns: 'http://www.w3.org/2000/svg',
+					'aria-hidden': 'true',
+					strokeWidth: props?.strokeWidth ?? 1,
+				},
+				h('path', {
+					d: 'M3 5.5h8.5M9.5 3.5 11.5 5.5 9.5 7.5',
+					stroke: 'currentColor',
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+				}),
+				h('path', {
+					d: 'M13 10.5H4.5M6.5 8.5 4.5 10.5 6.5 12.5',
+					stroke: 'currentColor',
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+				}),
+			)
+		}
+
+		/**
+		 * 侧边栏底部那个「精简 / 完整」开关图标。
+		 *
+		 * 位置：`sidebar.footer.action` —— DSH 自己声明在侧边栏底部、原「设置」图标
+		 * 旁边的那一格。精简页面把原生设置入口藏掉了（见 lite.js 的 LITE_HIDE），
+		 * 于是这里就是那个位置的唯一控件。
+		 *
+		 * 只在**手机（远程）页面**渲染：
+		 *   - 桌面窗口里直接返回 null（用户要求桌面端一个字节都不动）；
+		 *   - 完整模式页面里也返回 null（那时原生设置入口还在，用户不需要它）。
+		 * @param props - 插槽注入面给的 `ctx`。
+		 */
+		function LiteSwitch(props) {
+			const ctx = props.ctx
+			const [state, setState] = useState(null)
+			const [busy, setBusy] = useState(false)
+
+			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
+
+			const load = useCallback(async () => {
+				const result = await readJson(STATE_PATH)
+				if (result.ok) setState(result.data)
+			}, [])
+
+			useEffect(() => {
+				void load()
+			}, [load])
+
+			const toggle = useCallback(async () => {
+				if (state === null) return
+				const next = state.lite !== true
+				setBusy(true)
+				const result = await readJson(LITE_PATH, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ enabled: next }),
+				})
+				setBusy(false)
+				if (!result.ok) return
+				setState((previous) => ({ ...(previous ?? {}), lite: result.data.lite }))
+			}, [state])
+
+			// 桌面窗口：注册了也不渲染（双保险 —— apply 里其实一开始就不会注册）。
+			if (isDesktopWindow()) return null
+			// 只在精简页面上出现：完整模式下设置入口还在，用户从那里就能切回来。
+			const thisPageIsLite =
+				typeof globalThis !== 'undefined' && globalThis.__DSH_TAILSCALE_REMOTE_LITE__ === 'lite'
+			if (!thisPageIsLite) return null
+			if (state === null || state.liteAvailable !== true) return null
+
+			const label = state.lite === true ? t.liteDisable : t.liteEnable
+			return h(
+				'button',
+				{
+					type: 'button',
+					style: styles.iconButton,
+					disabled: busy,
+					title: label,
+					'aria-label': label,
+					'data-dsh-tailscale-remote-lite': '',
+					onClick: () => void toggle(),
+				},
+				h(LiteSwitchIcon, { size: 16, strokeWidth: 1 }),
+			)
+		}
+
+		/**
+		 * 注册这个插件的两处界面。
+		 *
+		 * **桌面窗口里什么都不注册** —— 用户要求「电脑端一个字节都不准动」，所以整个
+		 * 插件在桌面 App 里是个纯 no-op：设置页没有那一行、侧边栏底部没有那个图标，
+		 * 桌面上看到的 DSH 与没装本插件时完全一致。
+		 *
+		 * 用 `slots.inject` 而不是 `slots.register` 直调：插槽由别的包声明，它和本包的
+		 * 激活顺序没有保证。
 		 * @param ctx - 客户端根上下文。
 		 */
 		function apply(ctx) {
+			if (isDesktopWindow()) return
+
+			// 设置页那一行：手机链接 + 换密钥。
 			ctx.slots.inject('settings.general.item', () =>
 				ctx.slots.register(
 					{
@@ -564,6 +620,18 @@ window.__ModuleLoader__.load({
 						inject: () => ({ ctx }),
 					},
 					RemoteRow,
+				),
+			)
+			// 侧边栏底部的精简/完整开关图标：精简页面上它顶替被藏掉的设置入口。
+			ctx.slots.inject('sidebar.footer.action', () =>
+				ctx.slots.register(
+					{
+						name: 'sidebar.footer.action',
+						id: ROW_ID,
+						order: 10,
+						inject: () => ({ ctx }),
+					},
+					LiteSwitch,
 				),
 			)
 		}
