@@ -1,8 +1,8 @@
 {
   "name": "dsh-tailscale-remote",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "Publishes the DSH Web GUI on your tailnet whenever DSH runs, so a phone anywhere can connect, and removes the route on exit. The phone link lives in Settings -> General -> Phone access with one-click copy and key rotation: rotating revokes the old link and every session signed with it. The same link is in the loginUrl field of ~/.dsh/tailscale-remote.json.",
+  "description": "Publishes the DSH Web GUI on your tailnet whenever DSH runs, so a phone anywhere can connect, and removes the route on exit. Phone pages default to a lite plugin set (about 1.3 MB gzip instead of about 5.3 MB) that the desktop app never sees, switchable per user from the settings row. The phone link lives in Settings -> General -> Phone access with one-click copy and key rotation: rotating revokes the old link and every session signed with it. The same link is in the loginUrl field of ~/.dsh/tailscale-remote.json.",
   "license": "MIT",
   "author": "Ckarefulon",
   "publishConfig": {
@@ -48,6 +48,7 @@
   },
   "files": [
     "index.js",
+    "lite.js",
     "client/client.js",
     "cordis.patch.yml",
     "README.md",
@@ -55,7 +56,7 @@
     "locale/*.json"
   ],
   "scripts": {
-    "test": "node --test test/classify.test.mjs test/teardown.test.mjs test/routes.test.mjs test/client.test.mjs"
+    "test": "node --test test/classify.test.mjs test/teardown.test.mjs test/routes.test.mjs test/client.test.mjs test/lite.test.mjs"
   },
   "engines": {
     "node": ">=20"

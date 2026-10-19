@@ -29,6 +29,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+import { LITE_ROUTE, composeComboBody, composeLiteGraph, matchLiteRequest, rewriteIndex } from './lite.js'
+
 /** 稳定插件名。 */
 export const name = 'dsh-tailscale-remote'
 
@@ -113,6 +115,14 @@ function normalizeConfig(raw) {
     // 已经用泄露密钥登录过的人手里那张 10 年 cookie 依然有效。代价是所有设备
     // （含自己的手机）都要重新登录一次；点按钮的那台会被补发 cookie、不掉线。
     revokeSessionsOnRotate: source.revokeSessionsOnRotate !== false,
+    // 精简模式（默认开）：HTTP 渲染出来的 index.html 只带手机真正需要的那部分客户端插件，
+    // 首屏从约 5.3 MB gzip 降到约 1.3 MB。**桌面版不受影响**（它不经过这条路，见 lite.js 顶部）。
+    //
+    // 这里只是**默认值**：用户在设置页里切换过一次之后，以那个持久选择为准。
+    lite: source.lite !== false,
+    // 精简模式的种子包（不填就用 lite.js 里那份默认白名单）。
+    // 只在「DSH 升级后默认白名单失配、又想自己补几个包」时才需要。
+    liteSeeds: Array.isArray(source.liteSeeds) ? source.liteSeeds.filter((id) => typeof id === 'string') : undefined,
   }
 }
 
@@ -451,6 +461,183 @@ function sessionCookieHeader(minted) {
  */
 const STATE_PATH = '/api/dsh-tailscale-remote/state'
 const ROTATE_PATH = '/api/dsh-tailscale-remote/rotate'
+const LITE_PATH = '/api/dsh-tailscale-remote/lite'
+
+/**
+ * 精简模式：把 HTTP 渲染出来的那份页面裁小。
+ *
+ * 为什么整条路都挂在 `webServer` + `clientModules` 上，而不是改 DSH：DSH 的宿主半边
+ * 每次渲染 index 都会重跑一遍注入表（`collectIndexInjections`），`__DSH_BOOT__` 是
+ * 其中一行；本插件只加一个 `tapIndex` 变换，把**渲染结果**换掉，一行 DSH 代码都不动。
+ *
+ * 三个关键事实（都是读 DSH 源码 + 实测确认的，别凭直觉改）：
+ *
+ * 1. **桌面版走不到这条路。** Electron 直接读 dist 里的 index.html，再把
+ *    `injections` 表经 IPC 交给客户端，客户端靠 `__DSH_TRANSPORT__.loadBundle`
+ *    拉包。`tapIndex` 只参与 `webServer.renderIndex()`，而那只在
+ *    `dsh-host-frontend-static` 的 HTTP 回退路径上发生。所以桌面端一个字节都不会变。
+ *
+ * 2. **必须自己服务精简合并请求。** 精简图的包名与整图不同，URL 自然也不同；
+ *    `clientModules` 只按它自己那份整图的 URL 查表，认不出精简版 URL。于是本插件
+ *    另外注册一条前缀路由（`LITE_ROUTE`），从 `clientModules.clientPath(id)` 拿路径
+ *    再拼脚本。刻意用另一个前缀：`/plugins` 已经是 `client-modules` 的前缀路由，
+ *    重复注册会抛。
+ *
+ * 3. **`client-hmr` 不能留。** 它是唯一会通过 `/plugins/events` 把**完整**插件图推回
+ *    页面的插件；留着的话客户端立刻把裁掉的包全部重新拉一遍，精简白做。它不在种子
+ *    白名单里，闭包也不会带上它（没有任何保留包 inject 它）。已实测：精简集里没有第二个
+ *    会触发图同步的包。
+ */
+function createLiteController(scope, config, runtime) {
+  const webServer = scope.get('webServer', false)
+  const clientModules = scope.get('clientModules', false)
+  if (webServer === undefined || clientModules === undefined) {
+    // 桌面版的 web-runtime 组合里有 webServer；拿不到就静默放弃精简，页面照旧。
+    return undefined
+  }
+
+  const logger = scope.logger
+  /** 内核字节缓存：包名 → Buffer。合并请求每次都会重新拼，但读盘只读一次。 */
+  const bundleCache = new Map()
+
+  /**
+   * 用**当前**的整图重算一次精简图。
+   *
+   * 刻意每次渲染 index 时都重算：插件图会随 Loader 装配而变（`onGraphChanged`），
+   * 缓存住会让「先渲染、后装配」的时序下发出一个缺包的页面。代价是每次 index 请求
+   * 求一次闭包 —— 那是几十个字符串的集合运算，可忽略。
+   */
+  const currentLite = () => {
+    const full = clientModules.graph()
+    return composeLiteGraph(full, {
+      ...(config.liteSeeds === undefined ? {} : { seeds: config.liteSeeds }),
+    })
+  }
+
+  /** 读一个包的内核字节；读不到就返回 undefined（调用方回 404，让客户端自己回落单包 URL）。 */
+  const readBundle = async (id) => {
+    const cached = bundleCache.get(id)
+    if (cached !== undefined) return cached
+    const path = clientModules.clientPath(id)
+    if (typeof path !== 'string') return undefined
+    try {
+      const bytes = await readFile(path)
+      bundleCache.set(id, bytes)
+      return bytes
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 精简合并请求：`<路由>/??<包名>/client.js,...&rev=<rev>`。 */
+  const serveLiteBundle = async (req, res) => {
+    const url = req.url ?? '/'
+    const batch = matchLiteRequest(url, currentLite())
+    if (batch === undefined) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    const buffers = []
+    for (const id of batch.entries) {
+      const bytes = await readBundle(id)
+      if (bytes === undefined) {
+        // 少一个包就整段不成 —— 合并脚本里缺一个包会让紧随其后的包也注册失败，
+        // 客户端还得逐包重试。直接 404，让它走 client-modules 的单包 URL。
+        logger.warn(`tailscale-remote: 精简请求读不到 ${id} 的客户端包，回 404`)
+        res.writeHead(404)
+        res.end()
+        return
+      }
+      buffers.push(bytes)
+    }
+    res.writeHead(200, {
+      'content-type': 'text/javascript; charset=utf-8',
+      // 与 client-modules 自己的合并请求同口径：rev 变了 URL 就变，所以可以长期缓存。
+      'cache-control': 'public, max-age=31536000, immutable',
+    })
+    res.end(req.method === 'HEAD' ? undefined : composeComboBody(buffers))
+  }
+
+  // index 改写。**只碰渲染结果**，不碰 DSH 的任何服务状态。
+  // 改写只在「精简开着」且真的算出了精简图时发生；任何一步失败都原样返回完整页面。
+  scope.effect(
+    () =>
+      webServer.tapIndex((html) => {
+        if (!liteEnabled()) return html
+        const lite = currentLite()
+        if (lite === undefined) {
+          // 白名单在活图上失配（多半是 DSH 升级拆/改了包）。**宁可多发几 MB，也不能
+          // 发一个残缺页面** —— 手机上用户没有任何自救手段。只记一次日志，别刷屏。
+          warnLiteUnavailable('seed-mismatch')
+          return html
+        }
+        const result = rewriteIndex(html, { lite })
+        if (!result.changed) {
+          warnLiteUnavailable(result.reason)
+          return html
+        }
+        runtime.lite = { ids: lite.ids, removed: result.removed, preloads: result.preloads }
+        return result.html
+      }),
+    'tailscale-remote: lite index',
+  )
+
+  // 精简合并请求的投递路由。
+  //
+  // 为什么不复用 `clientModules.fetchBundle`：它按**整图**的 URL 查表，认不出精简图的
+  // URL（精简图的合并 URL 里包名更少、rev 也不同）。所以这里自己拼：包路径从
+  // `clientModules.clientPath(id)` 拿（那是 DSH 的公开读接口），字节从盘上读。
+  scope.effect(
+    () =>
+      webServer.register({
+        kind: 'prefix',
+        path: LITE_ROUTE,
+        handler: (req, res) => {
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.writeHead(405)
+            res.end()
+            return undefined
+          }
+          // 必须把 promise 交回给 webserver：它 `await route.handler(...)`，
+          // 丢掉的话请求会在 body 写出来之前就被当成处理完毕。
+          return serveLiteBundle(req, res).catch((error) => {
+            logger.warn(`tailscale-remote: 精简请求处理失败：${String(error?.message ?? error)}`)
+            if (!res.headersSent) {
+              res.writeHead(500)
+              res.end()
+            }
+          })
+        },
+      }),
+    'tailscale-remote: lite bundle route',
+  )
+
+  /** 只记一次同类日志，别在每个 index 请求上刷屏。 */
+  let lastWarn
+  const warnLiteUnavailable = (reason) => {
+    if (lastWarn === reason) return
+    lastWarn = reason
+    logger.warn(`tailscale-remote: 这一轮不精简页面（${String(reason)}），改发完整页面`)
+  }
+
+  /**
+   * 精简开关。
+   *
+   * 两层，顺序不能反：
+   *  1. `config.lite` 是**硬开关** —— 关掉就意味着这台实例不做这件事，用户的选择也翻不过来。
+   *     否则「配置里关了」会被「用户点过开启」压过去，那个配置项就成了谎话。
+   *  2. 在配置允许的前提下，用户的**持久选择**（`runtime.liteChoice`）优先于配置的默认值
+   *     —— 否则用户点了关闭、刷新页面又变回精简，看起来像按钮坏了。
+   * @returns 是否把页面裁小。
+   */
+  function liteEnabled() {
+    if (!config.lite) return false
+    return runtime.liteChoice ?? true
+  }
+
+  return { liteEnabled, currentLite, serveLiteBundle }
+}
 
 /**
  * DSH 浏览器会话 cookie 的签名密钥在 credentials 里的记录键。
@@ -545,6 +732,14 @@ function statePayload(config, runtime) {
     httpsPort: state?.httpsPort ?? config.httpsPort,
     cookieMaxAgeDays: state?.cookieMaxAgeDays ?? config.cookieMaxAgeDays,
     updatedAt: state?.updatedAt ?? null,
+    // 精简模式状态。`lite` 说的是**这份页面真的被裁了没有**（控制器已算出精简图并改写成功），
+    // `liteChoice` 说的是**用户选了什么**；两者在切换后、重载前会不一致，所以分开报。
+    lite: runtime.liteController === undefined ? null : runtime.liteController.liteEnabled(),
+    liteAvailable: runtime.liteController !== undefined,
+    liteChoice: runtime.liteChoice ?? null,
+    liteDefault: config.lite,
+    liteCount: runtime.lite?.ids?.length ?? null,
+    litePreloadRemoved: runtime.lite?.removed ?? null,
   }
 }
 
@@ -691,7 +886,7 @@ async function rotateLoginSecret(scope, config, runtime, deps = REAL_DEPS, reque
  * @param config - 归一化后的配置。
  * @param runtime - 活状态。
  */
-function registerAdminRoutes(scope, config, runtime) {
+function registerAdminRoutes(scope, config, runtime, deps = REAL_DEPS) {
   const connection = scope.get('connection', false)
   const routes = connection?.fetch
   if (routes === undefined) return
@@ -731,13 +926,7 @@ function registerAdminRoutes(scope, config, runtime) {
         requestBody: 'buffered',
         fetch: async (request) => {
           try {
-            const result = await rotateLoginSecret(
-              scope,
-              config,
-              runtime,
-              REAL_DEPS,
-              hostAuthority(request?.headers),
-            )
+            const result = await rotateLoginSecret(scope, config, runtime, deps, hostAuthority(request?.headers))
             // 补发的 cookie 必须由 HTTP 响应带走；放在 body 里没用。
             const cookie = typeof result.cookie === 'string' ? { 'set-cookie': result.cookie } : undefined
             const { cookie: _omitted, ...payload } = result
@@ -749,6 +938,66 @@ function registerAdminRoutes(scope, config, runtime) {
       }),
     'tailscale-remote: rotate route',
   )
+
+  // 切换精简模式。
+  //
+  // 为什么要走服务端而不是客户端存 localStorage：这个开关决定的是**宿主下一次渲染
+  // index 时发哪一版页面** —— 它必须让宿主知道，不能只存在浏览器里。写进状态文件
+  // 才能跨重启保留，也让手机和电脑看到同一个选择（用户可能从任意一端切）。
+  scope.effect(
+    () =>
+      routes.register({
+        path: LITE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          try {
+            const body = await request.json().catch(() => undefined)
+            const enabled = body?.enabled
+            if (typeof enabled !== 'boolean') {
+              return json({ ok: false, error: '缺少 enabled（布尔值）' }, 400)
+            }
+            const controller = runtime.liteController
+            if (controller === undefined) {
+              return json({ ok: false, error: '这条 DSH 上没有 Web 渲染路径，精简模式不可用' }, 409)
+            }
+            runtime.liteChoice = enabled
+            // 立刻写盘：用户切完通常马上刷新页面，重启后也得记住。
+            // 失败**不算失败**：这次切换在本次运行里已经生效，只是下次重启会回默认值。
+            //
+            // `deps` 必须一路透传到这里：这个函数写的是**真实的** `~/.dsh/tailscale-remote.json`，
+            // 而单测会调这条路由。测试若不替换 deps，就会把用户的持久登录密钥覆盖掉
+            // —— 下一次重启长出**新**密钥，手机上的书签当场失效。（这个坑真的踩过一次。）
+            const warning = await persistLiteChoice(scope, config, runtime, enabled, deps)
+            return json({ ok: true, lite: controller.liteEnabled(), ...(warning === undefined ? {} : { warning }) })
+          } catch (error) {
+            return json({ ok: false, error: String(error?.message ?? error) }, 409)
+          }
+        },
+      }),
+    'tailscale-remote: lite route',
+  )
+}
+
+/**
+ * 把精简开关的选择写进状态文件。
+ *
+ * 只在**已有状态文件**上改：没有的话（远程访问还没起来）就别凭空造一个，
+ * 那会写出一份缺 `authority` 的半截记录。
+ * @param deps - 依赖注入；测试必须替换掉它，否则会写真实的 `~/.dsh/tailscale-remote.json`。
+ * @returns 写失败时的提示文案；成功或无需写时返回 undefined（绝不抛）。
+ */
+async function persistLiteChoice(scope, config, runtime, enabled, deps = REAL_DEPS) {
+  const state = runtime.state
+  if (state === undefined) return undefined
+  const next = { ...state, lite: enabled, updatedAt: new Date().toISOString() }
+  try {
+    await deps.persistState(scope, next)
+    runtime.state = next
+    return undefined
+  } catch (error) {
+    return `选择已生效，但没能写进状态文件（下次重启可能回默认值）：${String(error?.message ?? error)}`
+  }
 }
 
 /**
@@ -771,6 +1020,15 @@ function freshRuntime(undo) {
     login: undefined,
     /** 回落跳转用的带令牌地址。 */
     handoffUrl: undefined,
+    /**
+     * 用户对精简模式的**持久选择**（写进状态文件，跨重启保留）。
+     * undefined = 从没选过，这时用配置里的默认值。
+     */
+    liteChoice: undefined,
+    /** 最近一次改写 index 的结果 `{ ids, removed, preloads }`；只用于状态端点观察。 */
+    lite: undefined,
+    /** `createLiteController` 的产物；桌面端没有 webServer/clientModules 时为 undefined。 */
+    liteController: undefined,
     undo,
   }
 }
@@ -815,6 +1073,21 @@ export function apply(ctx, rawConfig) {
 
     registerAdminRoutes(scope, config, runtime)
 
+    // 精简模式的装配。
+    //
+    // 单独一段嵌套 inject：`webServer` / `clientModules` 与 `connection` 的到达顺序没有
+    // 保证，只声明 `connection` 时这两个可能还没到。服务迟到也要装上，所以走 inject
+    // 而不是在这里一次性读（晚到会被 `ctx.get(..., false)` 静默跳过，精简就永远不生效）。
+    //
+    // 桌面版拿不到 `webServer`（那条渲染路径在 Electron 里），此时什么都不做 ——
+    // 这正是「桌面端一个字节都不动」的落点。
+    scope.inject(['webServer', 'clientModules'], (liteScope) => {
+      runtime.liteController = createLiteController(liteScope, config, runtime)
+      if (runtime.liteController !== undefined) {
+        ctx.logger.info('tailscale-remote: 精简模式已装配（只作用于 HTTP 渲染的页面，桌面端不受影响）')
+      }
+    })
+
     // 退出清理挂在这里：这是唯一可靠的关停挂点，且 disposer 绝不能 reject。
     scope.effect(() => async () => {
       if (undo.disposed) return
@@ -854,6 +1127,17 @@ async function setup(scope, config, undo, deps = REAL_DEPS, runtime = freshRunti
   runtime.undo = undo
   runtime.phase = 'starting'
   runtime.error = undefined
+
+  // 读回用户上次对精简模式的选择。读不到（首次运行 / 文件坏了）就保持 undefined，
+  // 由 `liteEnabled()` 回落配置默认值 —— 一条读失败的记录不该把默认行为改掉。
+  if (config.lite) {
+    const previous = await deps.loadState(scope, config)
+    if (typeof previous?.lite === 'boolean') {
+      runtime.liteChoice = previous.lite
+      logger.info(`tailscale-remote: 读回精简模式选择 = ${String(previous.lite)}`)
+    }
+  }
+
   const binary = await deps.resolveBinary(scope, config.binaryPath)
   if (binary === undefined) {
     runtime.phase = 'unavailable'
@@ -1003,6 +1287,8 @@ async function setup(scope, config, undo, deps = REAL_DEPS, runtime = freshRunti
     httpsPort: config.httpsPort,
     target,
     cookieMaxAgeDays: config.cookieMaxAgeDays,
+    // 精简模式的选择。写进来才能在重启后被 `setup` 读回去（见开头那段）。
+    lite: runtime.liteChoice ?? config.lite,
     updatedAt: new Date().toISOString(),
     stateFile: config.stateFile,
   }
@@ -1114,11 +1400,14 @@ export const internals = {
   rotateSessionSecret,
   hostAuthority,
   registerAdminRoutes,
+  createLiteController,
+  persistLiteChoice,
   freshRuntime,
   setup,
   teardown,
   REAL_DEPS,
   STATE_PATH,
   ROTATE_PATH,
+  LITE_PATH,
   AUTH_RECORD_KEY,
 }

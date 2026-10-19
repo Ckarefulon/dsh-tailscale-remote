@@ -165,21 +165,26 @@ function loadBundle(overrides = {}) {
     throw new Error(`unexpected module request: ${id}`)
   }
   const fetchImpl =
-    overrides.fetch ??
-    (async (path, options) => {
-      calls.push({ path, options })
-      return {
-        status: 200,
-        json: async () => ({
-          ok: true,
-          phase: 'ready',
-          canRotate: true,
-          loginUrl: 'https://host.ts.net:7259/remote/SECRET',
-          plainUrl: 'https://host.ts.net:7259/',
-          cookieMaxAgeDays: 3650,
-        }),
-      }
-    })
+    overrides.fetch === undefined
+      ? async (path, options) => {
+          calls.push({ path, options })
+          return {
+            status: 200,
+            json: async () => ({
+              ok: true,
+              phase: 'ready',
+              canRotate: true,
+              loginUrl: 'https://host.ts.net:7259/remote/SECRET',
+              plainUrl: 'https://host.ts.net:7259/',
+              cookieMaxAgeDays: 3650,
+            }),
+          }
+        }
+      : // 自定义 fetch 也照样记一遍：不记的话「点按钮有没有打到端点」就测不出来了。
+        async (path, options) => {
+          calls.push({ path, options })
+          return overrides.fetch(path, options)
+        }
   const run = new Function('window', 'document', 'navigator', 'globalThis', 'fetch', bundle)
   run(
     window,
@@ -411,6 +416,136 @@ describe('渲染出来的一行', () => {
     assert.ok(stringsOf(tree).join('\n').includes('Phone access'))
   })
 
+  // —— 精简模式那一段 ——————————————————————————————————————————————————————
+
+  /** 状态端点带精简字段的桩；同时应答 lite 切换端点（有状态地跟着翻转）。 */
+  const liteFetch = (lite, overrides = {}) => {
+    let current = lite
+    return async (path, options) => {
+      if (path === '/api/dsh-tailscale-remote/lite') {
+        current = JSON.parse(options.body).enabled
+        return { status: 200, json: async () => ({ ok: true, lite: current }) }
+      }
+      if (path !== '/api/dsh-tailscale-remote/state') throw new Error(`unexpected ${path}`)
+      return {
+        status: 200,
+        json: async () => ({
+          ok: true,
+          phase: 'ready',
+          canRotate: true,
+          loginUrl: 'https://host.ts.net:7259/remote/SECRET',
+          plainUrl: 'https://host.ts.net:7259/',
+          cookieMaxAgeDays: 3650,
+          liteAvailable: true,
+          lite: current,
+          liteChoice: current,
+          liteDefault: true,
+          liteCount: 35,
+          litePreloadRemoved: 2,
+          ...overrides,
+        }),
+      }
+    }
+  }
+
+  it('精简模式开着时显示「已开启」和关闭按钮（当前选择一眼可见）', async () => {
+    const { tree } = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(true) })
+    const text = stringsOf(tree).join('\n')
+    assert.ok(text.includes('精简模式'), '要有精简模式这一段的标题')
+    assert.ok(text.includes('已开启'), '当前状态要写出来')
+    assert.ok(text.includes('关闭精简模式'), '开着的时候按钮是「关闭」')
+  })
+
+  it('精简模式关着时显示「已关闭」和开启按钮', async () => {
+    const { tree } = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(false) })
+    const text = stringsOf(tree).join('\n')
+    assert.ok(text.includes('已关闭'))
+    assert.ok(text.includes('开启精简模式'))
+  })
+
+  it('liteAvailable=false 时整段不显示（桌面端摆一个点不动的开关只会显得坏掉）', async () => {
+    const { tree } = await renderRow({
+      locale: ZH_LOCALE,
+      fetch: liteFetch(null, { liteAvailable: false, lite: null, liteChoice: null }),
+    })
+    const boxes = find(tree, (node) => node.props?.['data-dsh-tailscale-remote-lite'] !== undefined)
+    assert.equal(boxes.length, 0, '不可用时不该渲染这一段')
+    assert.equal(stringsOf(tree).join('\n').includes('精简模式'), false)
+  })
+
+  it('页面标记为精简版时才说「这份页面是精简版」', async () => {
+    const withMarker = await renderRow({
+      locale: ZH_LOCALE,
+      fetch: liteFetch(true),
+      window: { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' },
+    })
+    assert.ok(stringsOf(withMarker.tree).join('\n').includes('当前这份页面是精简版'), '有标记时应说精简版')
+
+    const noMarker = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(true) })
+    assert.ok(stringsOf(noMarker.tree).join('\n').includes('当前这份页面是完整版'), '无标记时应说完整版')
+  })
+
+  it('点开关会 POST 到 lite 端点，且带着布尔 enabled（不是字符串）', async () => {
+    const { tree, renderer, calls } = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(true) })
+    const buttons = find(tree, (node) => node.type === 'button' && node.props?.onClick !== undefined)
+    const button = buttons.find((node) => stringsOf(node).includes('关闭精简模式'))
+    assert.ok(button !== undefined, '找不到精简开关按钮')
+
+    button.props.onClick()
+    await renderer.flush()
+
+    const call = calls.find((c) => c.path === '/api/dsh-tailscale-remote/lite')
+    assert.ok(call !== undefined, '必须打到 lite 端点')
+    assert.equal(call.options.method, 'POST')
+    const body = JSON.parse(call.options.body)
+    assert.equal(body.enabled, false, '开着时点一下就关：enabled 必须是 false')
+    assert.equal(typeof body.enabled, 'boolean', 'enabled 必须是布尔值，服务端会拒字符串')
+  })
+
+  it('切换成功后就地更新按钮，并提示「刷新后生效」（否则用户以为按钮坏了）', async () => {
+    const { tree, renderer, registration, props } = await renderRow({ locale: ZH_LOCALE, fetch: liteFetch(true) })
+    const button = find(tree, (node) => node.type === 'button' && node.props?.onClick !== undefined).find(
+      (node) => stringsOf(node).includes('关闭精简模式'),
+    )
+    button.props.onClick()
+    await renderer.flush()
+    // 这个夹具不会自动重渲染，所以照换密钥那几条的做法手动重渲染一次。
+    const after = renderer.render(registration.component, props)
+    await renderer.flush()
+
+    const text = stringsOf(after).join('\n')
+    assert.ok(text.includes('关闭精简'), '提示必须说清「刷新后生效」')
+    assert.ok(text.includes('开启精简模式'), '按钮要跟着翻成「开启」（说明本地状态真的更新了）')
+  })
+
+  it('切换失败时把原因显示出来，且不谎报状态', async () => {
+    const failing = async (path, options) => {
+      if (path === '/api/dsh-tailscale-remote/state') return liteFetch(true)(path, options)
+      return { status: 409, json: async () => ({ ok: false, error: '这条 DSH 上没有 Web 渲染路径' }) }
+    }
+    const { tree, renderer, registration, props } = await renderRow({ locale: ZH_LOCALE, fetch: failing })
+    const button = find(tree, (node) => node.type === 'button' && node.props?.onClick !== undefined).find(
+      (node) => stringsOf(node).includes('关闭精简模式'),
+    )
+    button.props.onClick()
+    await renderer.flush()
+    const after = renderer.render(registration.component, props)
+    await renderer.flush()
+
+    const text = stringsOf(after).join('\n')
+    assert.ok(text.includes('切换失败'), '失败必须说出来')
+    assert.ok(text.includes('这条 DSH 上没有 Web 渲染路径'), '要把服务端给的原因带上')
+    assert.ok(text.includes('已开启'), '失败时状态不能翻成「已关闭」')
+  })
+
+  it('英文环境下精简那一段也是英文', async () => {
+    const { tree } = await renderRow({ locale: EN_LOCALE, fetch: liteFetch(true) })
+    const text = stringsOf(tree).join('\n')
+    assert.ok(text.includes('Lite mode'))
+    assert.ok(text.includes('Disable lite mode'))
+    assert.equal(/[\u4e00-\u9fff]/.test(text), false, '英文环境下不该出现中文')
+  })
+
   it('绝不用 emoji 当图标（DSH 的图标语言里没有 emoji）', () => {
     const source = readFileSync(join(root, 'client', 'client.js'), 'utf8')
     assert.equal(
@@ -420,16 +555,17 @@ describe('渲染出来的一行', () => {
     )
   })
 
-  it('客户端写死的两个路径与宿主注册的逐字一致', () => {
+  it('客户端写死的三个路径与宿主注册的逐字一致', () => {
     // 两半各存一份路径表，这是刻意的（bundle 不能 import 宿主代码）。代价是漂移
     // 会**静默**失败：前端 fetch 一个没人注册的路径，得到 404，界面上只显示
     // 「HTTP 404」，看不出是路径写错了。所以这里显式把两份钉在一起。
     assert.ok(bundle.includes(`'${internals.STATE_PATH}'`), `bundle 里必须出现 ${internals.STATE_PATH}`)
     assert.ok(bundle.includes(`'${internals.ROTATE_PATH}'`), `bundle 里必须出现 ${internals.ROTATE_PATH}`)
+    assert.ok(bundle.includes(`'${internals.LITE_PATH}'`), `bundle 里必须出现 ${internals.LITE_PATH}`)
   })
 
-  it('两个路径都在 /api 前缀下（否则会绕过 DSH 的 fence 与鉴权）', () => {
-    for (const path of [internals.STATE_PATH, internals.ROTATE_PATH]) {
+  it('三个路径都在 /api 前缀下（否则会绕过 DSH 的 fence 与鉴权）', () => {
+    for (const path of [internals.STATE_PATH, internals.ROTATE_PATH, internals.LITE_PATH]) {
       assert.ok(path.startsWith('/api/'), `${path} 必须在 /api 下`)
       // 照抄 connection 的 endpointFromPath：剥掉 `/api/` 之后按 `/` 切，
       // 每个 segment 都不能是空、`.` 或 `..`（否则注册时直接抛错）。

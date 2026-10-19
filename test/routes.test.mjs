@@ -5,10 +5,23 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash, createHmac } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { internals } from '../index.js'
+import { LITE_SEEDS } from '../lite.js'
 
-const { statePayload, registerAdminRoutes, rotateLoginSecret, freshRuntime, installLoginRoute, STATE_PATH, ROTATE_PATH } =
-  internals
+const {
+  statePayload,
+  registerAdminRoutes,
+  rotateLoginSecret,
+  freshRuntime,
+  installLoginRoute,
+  createLiteController,
+  STATE_PATH,
+  ROTATE_PATH,
+  LITE_PATH,
+} = internals
 
 // 与生产默认值一致：换密钥同时吊销会话。测试若不打开它，就会把新增的那条路径
 // 整条跳过、全绿却什么都没验到。
@@ -89,6 +102,20 @@ function fakeScope({ routes = [], webRoutes = [], secret = Buffer.alloc(32, 5), 
   }
 }
 
+/**
+ * 一个**绝不写盘**的 deps。
+ *
+ * 为什么每条测试都要用它：`registerAdminRoutes` / `rotateLoginSecret` 在生产里会写**真实的**
+ * `~/.dsh/tailscale-remote.json`，而测试用的 scope 是桩。少了这个替换，跑一次测试就会把
+ * 用户的持久登录密钥覆盖成夹具里的 `host.ts.net` —— 下一次重启长出**新**密钥，
+ * 手机上的书签当场失效。（这个坑真的踩过一次，所以才做成默认值。）
+ */
+const MEMORY_DEPS = {
+  persistState: async (scope, state) => {
+    scope.store.__persisted = [...(scope.store.__persisted ?? []), state]
+  },
+}
+
 /** 取注册好的某条 fetch 路由。 */
 function routeFor(scope, path) {
   const route = scope.fetchRoutes.find((r) => r.path === path)
@@ -96,17 +123,18 @@ function routeFor(scope, path) {
   return route
 }
 
-test('两个端点都注册在 connection.fetch 上（白拿 DSH 的 fence 与 cookie 鉴权）', () => {
+test('三个端点都注册在 connection.fetch 上（白拿 DSH 的 fence 与 cookie 鉴权）', () => {
   const scope = fakeScope()
-  registerAdminRoutes(scope, CONFIG, freshRuntime({}))
+  registerAdminRoutes(scope, CONFIG, freshRuntime({}), MEMORY_DEPS)
 
   const paths = scope.fetchRoutes.map((r) => r.path).sort()
-  assert.deepEqual(paths, [ROTATE_PATH, STATE_PATH].sort())
+  assert.deepEqual(paths, [LITE_PATH, ROTATE_PATH, STATE_PATH].sort())
   // 绝不能注册成 webServer 的 exact 路由：那会遮掉整条 /api 前缀路由，
   // 把 Host/Origin fence 和浏览器鉴权一起绕过去。
   assert.deepEqual(scope.registered, [], '不该往 webServer 上注册任何 exact 路由')
   assert.equal(scope.fetchRoutes.find((r) => r.path === STATE_PATH).methods[0], 'GET')
   assert.equal(scope.fetchRoutes.find((r) => r.path === ROTATE_PATH).methods[0], 'POST')
+  assert.equal(scope.fetchRoutes.find((r) => r.path === LITE_PATH).methods[0], 'POST')
 })
 
 test('状态端点：就绪时给出链接与可换密钥标志', async () => {
@@ -122,7 +150,7 @@ test('状态端点：就绪时给出链接与可换密钥标志', async () => {
     cookieMaxAgeDays: 3650,
     updatedAt: '2026-10-12T00:00:00.000Z',
   }
-  registerAdminRoutes(scope, CONFIG, runtime)
+  registerAdminRoutes(scope, CONFIG, runtime, MEMORY_DEPS)
 
   const response = await routeFor(scope, STATE_PATH).fetch()
   assert.equal(response.status, 200)
@@ -139,7 +167,7 @@ test('状态端点：还在启动时也返回 200 并说清楚阶段（不是错
   const scope = fakeScope()
   const runtime = freshRuntime({})
   runtime.phase = 'starting'
-  registerAdminRoutes(scope, CONFIG, runtime)
+  registerAdminRoutes(scope, CONFIG, runtime, MEMORY_DEPS)
 
   const response = await routeFor(scope, STATE_PATH).fetch()
   // 「还在启动」是设置页要看的正常答案，不是失败 —— 用 200 + phase 表达。
@@ -156,7 +184,7 @@ test('状态端点：启动失败时把真正的原因带出来', async () => {
   const runtime = freshRuntime({})
   runtime.phase = 'error'
   runtime.error = '端口上有冲突的 Serve 配置'
-  registerAdminRoutes(scope, CONFIG, runtime)
+  registerAdminRoutes(scope, CONFIG, runtime, MEMORY_DEPS)
 
   const body = await (await routeFor(scope, STATE_PATH).fetch()).json()
   assert.equal(body.phase, 'error')
@@ -169,7 +197,7 @@ test('状态端点：loginRoute=false 时不允许换密钥（没有密钥可换
   const runtime = freshRuntime({})
   runtime.phase = 'ready'
   runtime.state = { plainUrl: 'https://h/', loginUrl: 'https://h/', cookieMaxAgeDays: 3650 }
-  registerAdminRoutes(scope, { ...CONFIG, loginRoute: false }, runtime)
+  registerAdminRoutes(scope, { ...CONFIG, loginRoute: false }, runtime, MEMORY_DEPS)
 
   const body = await (await routeFor(scope, STATE_PATH).fetch()).json()
   assert.equal(body.canRotate, false)
@@ -280,7 +308,7 @@ test('换密钥：webServer 不可用时明确拒绝（不假装成功）', asyn
 test('换密钥端点：失败时回 409 + ok:false + 原因（客户端靠 body 说话）', async () => {
   const scope = fakeScope()
   const runtime = freshRuntime({})
-  registerAdminRoutes(scope, CONFIG, runtime)
+  registerAdminRoutes(scope, CONFIG, runtime, MEMORY_DEPS)
 
   const response = await routeFor(scope, ROTATE_PATH).fetch()
   assert.equal(response.status, 409)
@@ -296,7 +324,7 @@ test('换密钥端点：成功后回 ok:true 和新链接', async () => {
   runtime.state = { plainUrl: 'https://host.ts.net:7259/', authority: 'host.ts.net:7259', cookieMaxAgeDays: 3650 }
   // 直接替换成不写盘的实现，避免碰真实 $DSH_HOME。
   runtime.undo = {}
-  registerAdminRoutes(scope, CONFIG, runtime)
+  registerAdminRoutes(scope, CONFIG, runtime, MEMORY_DEPS)
   // 把真实 persistState 换掉：这里只关心 HTTP 层的形状。
   const original = internals.REAL_DEPS.persistState
   internals.REAL_DEPS.persistState = async () => {}
@@ -325,7 +353,7 @@ test('enabled=false 时仍然注册端点，好让设置页回答「为什么没
   const scope = fakeScope()
   const runtime = freshRuntime({})
   runtime.phase = 'disabled'
-  registerAdminRoutes(scope, { ...CONFIG, enabled: false }, runtime)
+  registerAdminRoutes(scope, { ...CONFIG, enabled: false }, runtime, MEMORY_DEPS)
 
   const body = await (await routeFor(scope, STATE_PATH).fetch()).json()
   assert.equal(body.ok, true)
@@ -407,7 +435,7 @@ test('换密钥后，用旧签名密钥铸的 cookie 再也验不过（这才是
 test('从哪台设备发起更换，就只有那台被补发 cookie（点按钮的不会掉线）', async () => {
   const scope = fakeScope()
   const runtime = readyRuntime(scope)
-  registerAdminRoutes(scope, CONFIG, runtime)
+  registerAdminRoutes(scope, CONFIG, runtime, MEMORY_DEPS)
 
   const response = await routeFor(scope, ROTATE_PATH).fetch({
     headers: new Headers({ host: 'host.ts.net:7259' }),
@@ -438,7 +466,7 @@ test('从哪台设备发起更换，就只有那台被补发 cookie（点按钮�
 test('拿不到 Host 头时不补发 cookie，但照样吊销（不静默降级成「没吊销」）', async () => {
   const scope = fakeScope()
   const runtime = readyRuntime(scope)
-  registerAdminRoutes(scope, CONFIG, runtime)
+  registerAdminRoutes(scope, CONFIG, runtime, MEMORY_DEPS)
 
   const response = await routeFor(scope, ROTATE_PATH).fetch({ headers: new Headers({}) })
   assert.equal(response.status, 200)
@@ -512,14 +540,309 @@ test('revokeSessionsOnRotate=false 时只换登录密钥，不碰会话（可选
 test('状态端点会告诉客户端「换密钥会踢掉所有设备」', async () => {
   const scope = fakeScope()
   const runtime = readyRuntime(scope)
-  registerAdminRoutes(scope, CONFIG, runtime)
+  registerAdminRoutes(scope, CONFIG, runtime, MEMORY_DEPS)
 
   const body = await (await routeFor(scope, STATE_PATH).fetch()).json()
   assert.equal(body.revokesSessions, true)
 
   const off = fakeScope()
   const offRuntime = readyRuntime(off)
-  registerAdminRoutes(off, { ...CONFIG, revokeSessionsOnRotate: false }, offRuntime)
+  registerAdminRoutes(off, { ...CONFIG, revokeSessionsOnRotate: false }, offRuntime, MEMORY_DEPS)
   const offBody = await (await routeFor(off, STATE_PATH).fetch()).json()
   assert.equal(offBody.revokesSessions, false)
+})
+
+// —— 精简模式 ——————————————————————————————————————————————————————————————
+
+/**
+ * 精简测试用的插件图：白名单里的包 + 两个该被裁掉的大包。
+ * 用真实白名单（而不是造几个假名字），这样「种子失配」这类改动会立刻被这里抓到。
+ */
+const SAMPLE_GRAPH = {
+  rev: 'graphrev',
+  release: { version: '9.9.9' },
+  entries: [
+    ...LITE_SEEDS.map((id) => ({ id, url: `plugins/??${id}/client.js&rev=r-${id}`, rev: `r-${id}` })),
+    { id: '@deepseek-ai/dsh-client-ui-settings-account', url: 'plugins/??x&rev=1', rev: '1' },
+    { id: '@deepseek-ai/dsh-client-hmr', url: 'plugins/??x&rev=2', rev: '2' },
+  ],
+  batches: [
+    { phase: 'bootstrap', url: 'plugins/??@deepseek-ai/dsh-client-modules/client.js&rev=b', rev: 'b', entries: ['@deepseek-ai/dsh-client-modules'] },
+    { phase: 'application', url: 'plugins/??everything', rev: 'all', entries: [] },
+  ],
+}
+SAMPLE_GRAPH.batches[1].entries = SAMPLE_GRAPH.entries.map((e) => e.id)
+
+/** 形态照抄真实 index.html：application 段是 preload，bootstrap 段是 script-src。 */
+const SAMPLE_INDEX = [
+  '<!doctype html><html><head>',
+  '<link rel="preload" as="script" href="plugins/??@deepseek-ai/a/client.js&amp;rev=one">',
+  '<script src="plugins/??@deepseek-ai/dsh-client-modules/client.js&amp;rev=b"></script>',
+  '<script>globalThis["__DSH_BOOT__"] = {"rev":"graphrev","release":{"version":"9.9.9"},"entries":[{"id":"@deepseek-ai/a","url":"plugins/??a","rev":"ra"}],"batches":[]}</script>',
+  '</head><body><div id="root"></div></body></html>',
+].join('\n')
+
+/** 一个带 webServer/clientModules 的 scope：控制器要的两个服务都得在。 */
+function liteScope({ graph, clientPath } = {}) {
+  const scope = fakeScope()
+  const server = scope.store.webServer
+  server.taps = []
+  server.tapIndex = (transform) => {
+    server.taps.push(transform)
+    return () => {
+      const at = server.taps.indexOf(transform)
+      if (at !== -1) server.taps.splice(at, 1)
+    }
+  }
+  const paths = clientPath ?? {}
+  scope.store.clientModules = {
+    graph: () => graph,
+    clientPath: (id) => paths[id],
+  }
+  return scope
+}
+
+const LITE_CONFIG = { ...CONFIG, lite: true }
+
+test('控制器：注册前缀路由 + tapIndex，绝不动 /plugins（那是 client-modules 的前缀路由）', () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = freshRuntime({})
+  const controller = createLiteController(scope, LITE_CONFIG, runtime)
+
+  assert.ok(controller !== undefined, '服务齐全时必须装得上')
+  const liteRoute = scope.registered.find((r) => r.path === '/remote-lite-plugins')
+  assert.ok(liteRoute !== undefined, '精简合并请求必须有自己的路由')
+  assert.equal(liteRoute.kind, 'prefix')
+  // 重复注册 `/plugins` 会抛（client-modules 已经占了那条前缀），这里必须另起一个。
+  assert.equal(scope.registered.filter((r) => r.path === '/plugins').length, 0)
+  assert.equal(scope.store.webServer.taps.length, 1, 'index 改写必须挂在 tapIndex 上')
+})
+
+test('控制器：服务缺席时返回 undefined（桌面端就是这条路，什么都不做）', () => {
+  const noWeb = liteScope({ graph: SAMPLE_GRAPH })
+  delete noWeb.store.webServer
+  assert.equal(createLiteController(noWeb, LITE_CONFIG, freshRuntime({})), undefined)
+
+  const noModules = liteScope({ graph: SAMPLE_GRAPH })
+  delete noModules.store.clientModules
+  assert.equal(createLiteController(noModules, LITE_CONFIG, freshRuntime({})), undefined)
+})
+
+test('控制器：开关关掉时 tapIndex 原样返回（一个字节都不改）', () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = freshRuntime({})
+  const controller = createLiteController(scope, LITE_CONFIG, runtime)
+  runtime.liteChoice = false
+
+  const html = SAMPLE_INDEX
+  assert.equal(scope.store.webServer.taps[0](html), html)
+  assert.equal(controller.liteEnabled(), false)
+})
+
+test('控制器：开关打开时真的改写，并把结果记进 runtime 供状态端点观察', () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = freshRuntime({})
+  createLiteController(scope, LITE_CONFIG, runtime)
+
+  const out = scope.store.webServer.taps[0](SAMPLE_INDEX)
+  assert.notEqual(out, SAMPLE_INDEX)
+  assert.ok(out.includes('"__DSH_TAILSCALE_REMOTE_LITE__"'))
+  assert.ok(runtime.lite.ids.length > 0)
+  assert.ok(runtime.lite.ids.length < SAMPLE_GRAPH.entries.length, '必须真的裁掉了包')
+})
+
+test('控制器：白名单在活图上失配时原样返回完整页面（绝不发残缺页面）', () => {
+  const scope = liteScope({ graph: { rev: 'r', entries: [{ id: '@x', url: 'u', rev: 'v' }], batches: [] } })
+  const runtime = freshRuntime({})
+  createLiteController(scope, LITE_CONFIG, runtime)
+
+  const html = SAMPLE_INDEX
+  assert.equal(scope.store.webServer.taps[0](html), html, '算不出精简图就必须原样返回')
+  assert.equal(runtime.lite, undefined)
+  assert.ok(scope.logs.some((line) => line.includes('seed-mismatch')), '必须留下日志，别静默')
+})
+
+test('控制器：config.lite=false 时永不精简（配置默认关掉了）', () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = freshRuntime({})
+  const controller = createLiteController(scope, { ...CONFIG, lite: false }, runtime)
+  assert.equal(controller.liteEnabled(), false)
+  assert.equal(scope.store.webServer.taps[0](SAMPLE_INDEX), SAMPLE_INDEX)
+})
+
+test('控制器：用户的选择压过配置默认值，但压不过 config.lite=false（硬开关）', () => {
+  // 配置允许时，用户点过「关闭」就该一直关着，哪怕配置默认是开。
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = freshRuntime({})
+  const controller = createLiteController(scope, LITE_CONFIG, runtime)
+  assert.equal(controller.liteEnabled(), true, '没选过就随配置默认（开）')
+  runtime.liteChoice = false
+  assert.equal(controller.liteEnabled(), false, '用户选择必须压过配置默认值')
+  assert.equal(scope.store.webServer.taps[0](SAMPLE_INDEX), SAMPLE_INDEX)
+
+  // 配置硬关时，用户怎么选都不精简 —— 否则那个配置项就是谎话。
+  const hard = liteScope({ graph: SAMPLE_GRAPH })
+  const hardRuntime = freshRuntime({})
+  const hardController = createLiteController(hard, { ...CONFIG, lite: false }, hardRuntime)
+  hardRuntime.liteChoice = true
+  assert.equal(hardController.liteEnabled(), false, 'config.lite=false 是硬开关，谁也翻不过来')
+})
+
+test('精简合并请求：送出的脚本体去掉了 sourceMappingURL，且带上不可变缓存头', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const { composeLiteGraph } = await import('../lite.js')
+  const lite = composeLiteGraph(SAMPLE_GRAPH)
+  const batch = lite.batches.find((b) => b.phase === 'application')
+
+  // 用一个临时目录造真实的包文件，clientPath 指过去。
+  const dir = await mkdtemp(join(tmpdir(), 'lite-'))
+  const paths = {}
+  for (const id of batch.entries) {
+    const file = join(dir, `${id.replace(/[@/]/g, '_')}.js`)
+    await writeFile(file, `register(${JSON.stringify(id)})\n//# sourceMappingURL=x.map\n`)
+    paths[id] = file
+  }
+
+  const scope = liteScope({ graph: SAMPLE_GRAPH, clientPath: paths })
+  createLiteController(scope, LITE_CONFIG, freshRuntime({}))
+
+  const route = scope.registered.find((r) => r.path === '/remote-lite-plugins')
+  const sent = { body: undefined, status: undefined, headers: undefined }
+  await route.handler(
+    { method: 'GET', url: `/${batch.url}` },
+    {
+      writeHead: (status, headers) => {
+        sent.status = status
+        sent.headers = headers
+      },
+      end: (body) => {
+        sent.body = body
+      },
+      headersSent: false,
+    },
+  )
+
+  assert.equal(sent.status, 200)
+  assert.match(sent.headers['cache-control'], /immutable/)
+  assert.equal(sent.headers['content-type'], 'text/javascript; charset=utf-8')
+  const text = sent.body.toString('utf8')
+  assert.ok(!text.includes('sourceMappingURL'), '尾指令必须去掉')
+  for (const id of batch.entries) assert.ok(text.includes(id), `缺 ${id} 的字节`)
+
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('精简合并请求：缺任何一个包就整段 404（客户端会回落单包 URL）', async () => {
+  const { composeLiteGraph } = await import('../lite.js')
+  const lite = composeLiteGraph(SAMPLE_GRAPH)
+  const batch = lite.batches.find((b) => b.phase === 'application')
+
+  // 只给第一个包一个真路径，其余 clientPath 全是 undefined。
+  const dir = await mkdtemp(join(tmpdir(), 'lite-'))
+  const file = join(dir, 'one.js')
+  await writeFile(file, 'register("one")\n')
+  const scope = liteScope({ graph: SAMPLE_GRAPH, clientPath: { [batch.entries[0]]: file } })
+  createLiteController(scope, LITE_CONFIG, freshRuntime({}))
+
+  const route = scope.registered.find((r) => r.path === '/remote-lite-plugins')
+  const sent = { status: undefined }
+  await route.handler(
+    { method: 'GET', url: `/${batch.url}` },
+    { writeHead: (status) => (sent.status = status), end: () => {}, headersSent: false },
+  )
+  assert.equal(sent.status, 404)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('精简合并请求：非本路由 / 别的 rev / 非 GET 都拒绝', async () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  createLiteController(scope, LITE_CONFIG, freshRuntime({}))
+  const route = scope.registered.find((r) => r.path === '/remote-lite-plugins')
+
+  const call = async (method, url) => {
+    const sent = { status: undefined }
+    await route.handler(
+      { method, url },
+      { writeHead: (status) => (sent.status = status), end: () => {}, headersSent: false },
+    )
+    return sent.status
+  }
+
+  assert.equal(await call('GET', '/plugins/??whatever'), 404)
+  assert.equal(await call('GET', '/remote-lite-plugins/??@x/client.js&rev=stale'), 404)
+  assert.equal(await call('POST', '/remote-lite-plugins/??@x/client.js&rev=stale'), 405)
+})
+
+test('精简开关端点：写盘、活状态、以及缺 enabled 时的 400', async () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = readyRuntime(scope)
+  runtime.liteController = createLiteController(scope, LITE_CONFIG, runtime)
+  registerAdminRoutes(scope, LITE_CONFIG, runtime, MEMORY_DEPS)
+  const route = routeFor(scope, LITE_PATH)
+
+  // 缺 enabled → 400，且不能改动活状态。
+  const bad = await route.fetch({ json: async () => ({}) })
+  assert.equal(bad.status, 400)
+  assert.equal(runtime.liteChoice, undefined)
+
+  // 明确关闭 → 活状态变 false，且**经 deps 写**进状态文件。
+  const off = await route.fetch({ json: async () => ({ enabled: false }) })
+  assert.equal(off.status, 200)
+  const offBody = await off.json()
+  assert.equal(offBody.ok, true)
+  assert.equal(offBody.lite, false)
+  assert.equal(runtime.liteChoice, false)
+  assert.equal(runtime.state.lite, false, '必须写盘，否则重启就回默认值了')
+  // 关键：写盘必须走注入进来的 deps —— 漏了它就会去写真实的
+  // ~/.dsh/tailscale-remote.json，把用户的持久登录密钥覆盖掉。
+  assert.equal(scope.store.__persisted.length, 1, '必须通过 deps 写盘')
+  assert.equal(scope.store.__persisted[0].lite, false)
+
+  // 再打开 → 立刻生效。
+  const on = await route.fetch({ json: async () => ({ enabled: true }) })
+  assert.equal((await on.json()).lite, true)
+  assert.equal(runtime.liteChoice, true)
+  assert.equal(scope.store.__persisted.length, 2)
+  assert.equal(scope.store.__persisted[1].lite, true)
+  // 写盘的内容必须保住别的字段（尤其 loginSecret —— 丢了它重启就换密钥了）。
+  assert.equal(scope.store.__persisted[1].loginSecret, runtime.state.loginSecret)
+})
+
+test('精简开关端点：控制器缺席时明确拒绝（这台 DSH 没有 Web 渲染路径）', async () => {
+  const scope = fakeScope()
+  const runtime = readyRuntime(scope)
+  registerAdminRoutes(scope, LITE_CONFIG, runtime, MEMORY_DEPS)
+
+  const response = await routeFor(scope, LITE_PATH).fetch({ json: async () => ({ enabled: true }) })
+  assert.equal(response.status, 409)
+  assert.equal((await response.json()).ok, false)
+})
+
+test('状态端点如实报告精简模式的「选择」与「这份页面是否真的被裁了」', async () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = readyRuntime(scope)
+  runtime.liteController = createLiteController(scope, LITE_CONFIG, runtime)
+  registerAdminRoutes(scope, LITE_CONFIG, runtime, MEMORY_DEPS)
+
+  const before = await (await routeFor(scope, STATE_PATH).fetch()).json()
+  assert.equal(before.lite, true)
+  assert.equal(before.liteAvailable, true)
+  assert.equal(before.liteChoice, null, '还没选过就是 null（不是 false）')
+
+  // 真的渲染一次，liteCount 才有值。
+  scope.store.webServer.taps[0](SAMPLE_INDEX)
+  const after = await (await routeFor(scope, STATE_PATH).fetch()).json()
+  assert.ok(after.liteCount > 0)
+  assert.ok(after.litePreloadRemoved > 0)
+
+  // 没有控制器的 DSH（桌面端）如实报 unavailable，而不是假装「已开启」。
+  const bare = fakeScope()
+  const bareRuntime = readyRuntime(bare)
+  registerAdminRoutes(bare, LITE_CONFIG, bareRuntime, MEMORY_DEPS)
+  const bareBody = await (await routeFor(bare, STATE_PATH).fetch()).json()
+  assert.equal(bareBody.liteAvailable, false)
+  assert.equal(bareBody.lite, null)
+
+  // 配置默认值也要报出来，用户才知道「不选的话是哪一版」。
+  assert.equal(bareBody.liteDefault, true)
 })

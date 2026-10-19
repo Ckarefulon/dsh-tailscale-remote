@@ -36,6 +36,7 @@ window.__ModuleLoader__.load({
 
 		const STATE_PATH = '/api/dsh-tailscale-remote/state'
 		const ROTATE_PATH = '/api/dsh-tailscale-remote/rotate'
+		const LITE_PATH = '/api/dsh-tailscale-remote/lite'
 
 		/**
 		 * 行内字典。
@@ -68,6 +69,18 @@ window.__ModuleLoader__.load({
 			phaseStarting: '还在启动中（拉起 Tailscale / 建立 Serve 路由）。',
 			phaseUnavailable: 'Tailscale 没在运行，远程访问暂时不可用。',
 			phaseError: '远程访问没能建起来。',
+			liteTitle: '精简模式',
+			liteDescription: '手机打开的那个页面只加载最基础的插件，体积从约 5 MB 降到约 1.3 MB。桌面上这个窗口不受任何影响。',
+			liteOn: '已开启',
+			liteOff: '已关闭',
+			liteEnable: '开启精简模式',
+			liteDisable: '关闭精简模式',
+			liteReloadHint: '已保存。刷新手机上的页面后生效。',
+			liteFullHint: '已关闭精简。刷新手机上的页面后生效，届时会加载全部插件。',
+			liteUnavailable: '这条 DSH 上没有 Web 页面渲染路径，精简模式不可用（桌面端本来就只发完整版）。',
+			litePage: (count) => `当前这份页面是精简版，共 ${count} 个插件。`,
+			litePageFull: '当前这份页面是完整版（所有插件）。',
+			liteFailed: '切换失败',
 		}
 
 		const EN = {
@@ -94,6 +107,18 @@ window.__ModuleLoader__.load({
 			phaseStarting: 'Still starting up (bringing up Tailscale / the Serve route).',
 			phaseUnavailable: 'Tailscale is not running, so remote access is unavailable.',
 			phaseError: 'Remote access could not be established.',
+			liteTitle: 'Lite mode',
+			liteDescription: 'The page a phone opens loads only the essential plugins — about 1.3 MB instead of about 5 MB. This desktop window is not affected at all.',
+			liteOn: 'On',
+			liteOff: 'Off',
+			liteEnable: 'Enable lite mode',
+			liteDisable: 'Disable lite mode',
+			liteReloadHint: 'Saved. It applies after reloading the page on your phone.',
+			liteFullHint: 'Lite mode is off. It applies after reloading the page on your phone, which then loads every plugin.',
+			liteUnavailable: 'This DSH has no Web page rendering path, so lite mode is unavailable (the desktop app always sends the full set anyway).',
+			litePage: (count) => `This page is the lite version, with ${count} plugins.`,
+			litePageFull: 'This page is the full version (every plugin).',
+			liteFailed: 'Switch failed',
 		}
 
 		/**
@@ -174,6 +199,13 @@ window.__ModuleLoader__.load({
 				color: '#fff',
 			},
 			hint: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary,#6b7280)' },
+			liteBox: {
+				display: 'flex',
+				flexDirection: 'column',
+				gap: 8,
+				paddingTop: 12,
+				borderTop: '.5px solid var(--dsw-alias-border-l2,#e5e7eb)',
+			},
 			warn: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-state-warn-primary,#b45309)' },
 			error: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-state-error-primary,#dc2626)' },
 			ok: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-state-success-primary,#16a34a)' },
@@ -234,6 +266,7 @@ window.__ModuleLoader__.load({
 			const [copied, setCopied] = useState(false)
 			const [confirming, setConfirming] = useState(false)
 			const [notice, setNotice] = useState(null)
+			const [liteBusy, setLiteBusy] = useState(false)
 			const inputRef = useRef(null)
 
 			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
@@ -316,6 +349,33 @@ window.__ModuleLoader__.load({
 			}, [t])
 
 			const canRotate = state !== null && state.canRotate === true && !busy
+
+			/**
+			 * 切换精简模式。
+			 *
+			 * 走服务端（不是 localStorage）：这个开关决定的是**宿主下一次渲染 index 时
+			 * 发哪一版页面**，必须让宿主知道。写完就地更新本地状态，于是按钮立刻反映
+			 * 新选择；页面本身要等刷新才会变，所以提示文案必须说清这一点 ——
+			 * 否则用户切完发现「没什么变化」，会以为按钮坏了。
+			 */
+			const toggleLite = useCallback(async () => {
+				if (state === null) return
+				const next = state.lite !== true
+				setLiteBusy(true)
+				setNotice(null)
+				const result = await readJson(LITE_PATH, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ enabled: next }),
+				})
+				setLiteBusy(false)
+				if (!result.ok) {
+					setNotice(`${t.liteFailed}：${result.error}`)
+					return
+				}
+				setState((previous) => ({ ...(previous ?? {}), lite: result.data.lite }))
+				setNotice(result.data.lite ? t.liteReloadHint : t.liteFullHint)
+			}, [state, t])
 			// 文案必须跟着实际行为走：吊销会话时警告要说清「所有设备都会退出」，
 			// 否则用户以为只是换个链接，结果手机被踢下线、还不知道为什么。
 			const revokes = state !== null && state.revokesSessions === true
@@ -334,6 +394,57 @@ window.__ModuleLoader__.load({
 			}
 
 			const hint = describePhase(t, state)
+
+			/**
+			 * 「这份页面跑的是哪一版」。
+			 *
+			 * 读的是宿主在改写 index 时种下的标记，**不是** `__DSH_BOOT__` 的行数：
+			 * 后者是拿数字当契约，DSH 一升级就骗人。标记只说明这一份页面是不是精简版，
+			 * 与整图长什么样无关。拿不到标记（桌面端、或完整版页面）时为 undefined。
+			 */
+			const litePage =
+				typeof globalThis !== 'undefined' && globalThis.__DSH_TAILSCALE_REMOTE_LITE__ === 'lite'
+					? (state?.liteCount ?? undefined)
+					: undefined
+
+			/**
+			 * 精简模式那一段。
+			 *
+			 * `liteAvailable === false` 时（桌面端 / 没有 Web 渲染路径）整段不显示：
+			 * 摆一个永远点不动的开关只会让人以为插件坏了。
+			 */
+			const liteBlock =
+				state === null || state.liteAvailable !== true
+					? null
+					: h(
+							'div',
+							{ style: styles.liteBox, 'data-dsh-tailscale-remote-lite': '' },
+							h(
+								'div',
+								{ style: styles.head },
+								h(
+									'div',
+									null,
+									h('div', { style: styles.label }, `${t.liteTitle}${state.lite === true ? ` · ${t.liteOn}` : ` · ${t.liteOff}`}`),
+									h('div', { style: styles.description }, t.liteDescription),
+									h(
+										'div',
+										{ style: styles.hint },
+										litePage === undefined ? t.litePageFull : t.litePage(litePage),
+									),
+								),
+								h(
+									'button',
+									{
+										type: 'button',
+										style: styles.button,
+										disabled: liteBusy,
+										onClick: () => void toggleLite(),
+									},
+									state.lite === true ? t.liteDisable : t.liteEnable,
+								),
+							),
+						)
 
 			return h(
 				'div',
@@ -430,6 +541,7 @@ window.__ModuleLoader__.load({
 							usesLoginUrl ? `${t.keepBookmark}${t.cookieHint(state?.cookieMaxAgeDays ?? 0)}` : t.noLogin,
 						)
 					: h('div', { style: styles.hint }, hint),
+				liteBlock,
 			)
 		}
 
