@@ -401,3 +401,22 @@ test('布局修正与隐藏规则在同一段 <style> 里，且总共只注入�
   const styles = result.html.match(/<style data-dsh-tailscale-remote-hide>/g) ?? []
   assert.equal(styles.length, 1, '只该注入一段 style')
 })
+test('收起态与展开态是两套 DOM：搜索必须两个选择器都藏', () => {
+  // 实测（真浏览器）：
+  //   展开：`.sectionHeader > .searchSlot > .search > .searchButton`
+  //   收起：`.root.rail      > .search      > .searchButton`   ← 没有 searchSlot，
+  //          而且 `.sectionHeader` 仍在（35×36）但搜索按钮在它**外面**。
+  // 所以只藏 searchSlot / sectionHeader 都会漏，必须再按按钮本身藏一条。
+  assert.ok(LITE_HIDE.includes('[class*="_searchSlot"]'), '要藏搜索那一格（展开态）')
+  assert.ok(LITE_HIDE.includes('[class*="_searchButton"]'), '要藏按钮本身（收起态）')
+  // 整行（工作区标题 + 搜索 + 视图选项）也要藏。
+  assert.ok(LITE_HIDE.includes('[class*="_sectionHeader"]'), '要藏「工作区」那一行')
+})
+
+test('精简页面上不出现设置按钮（用户要求：那个位置放切换模式的图标）', () => {
+  // 精简模式下 `ui-settings` 的触发按钮会被客户端半边的 DOM 增强**接管**成
+  // 切换控件，所以 CSS 里**不能**藏 `sidebar.settings` —— 藏了就连切换控件一起没了。
+  assert.equal(LITE_HIDE.includes('[data-slot="sidebar.settings"]'), false, '不能藏整个设置座位')
+  // 但原生设置图标的 aria-label 是「设置」，切换后会变成「切至完整模式」，
+  // 由 client 半边负责替换（见 useSwitchHook）。
+})

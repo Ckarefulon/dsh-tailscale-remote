@@ -631,41 +631,63 @@ window.__ModuleLoader__.load({
 
 				/**
 				 * 精简模式：把「设置」那一格换成切换控件。
-				 * @returns 是否已经处理完（处理过就不重复做）。
+				 *
+				 * **必须幂等**：React 会随时重建这一块 DOM（展开/收起、语言切换、
+				 * 设置页开关都会触发），而且图标与文字**不是同时挂上**的 —— 实测
+				 * 第一次跑到这里时图标在、label 还没渲染出来。所以每次 sync 都要来
+				 * 这里补齐，只补缺的那部分，不去重复改已经改好的。
+				 * @returns 是否已经全部处理完。
 				 */
 				const hookSettingsSeat = () => {
 					const trigger = document.querySelector('[data-slot="settings.trigger"]')
 					const button = trigger?.closest('button')
 					if (trigger === undefined || trigger === null || button === null) return false
-					// 只做一次；已标记就跳过（DOM 重建后标记会丢，那就重做）。
-					if (button.dataset.dshLiteSeat === '1') return true
 
-					// 1) 换图标：把它原来的 svg 摘下来存好，塞我们的。
-					const originalSvg = trigger.querySelector('svg')
-					if (originalSvg !== null) {
-						const parent = originalSvg.parentElement
-						const nextSibling = originalSvg.nextSibling
-						parent.removeChild(originalSvg)
-						// 我们的图标用一个占位容器，方便整体移除。
-						const holder = document.createElement('span')
-						holder.style.display = 'contents'
-						parent.insertBefore(holder, nextSibling)
-						// 直接写 SVG 字符串：这里不在 React 树里，用 innerHTML 最省事，
-						// 也避免为了这一个图标去 require('react-dom')。
-						holder.innerHTML = LITE_ICON_SVG(16, 1.3)
-						touched.push({
-							restore() {
-								if (holder.parentElement !== null) holder.parentElement.removeChild(holder)
-								if (parent.isConnected) parent.insertBefore(originalSvg, nextSibling)
-							},
-						})
+					const wantText = pickLanguageText((dict) => dict.liteSwitchToFull)
+					let done = true
+
+					// 1) 换图标：把原来的 svg 摘下来存好，塞我们的。
+					//    判据是「里头有没有我们那两条 path」而不是「有没有标记」——
+					//    React 重建会把我塞的 span 连同标记一起丢掉，但标记在 button 上
+					//    会留下来，用标记判断就会漏掉重建后的那一份。
+					const mineAlready = [...trigger.querySelectorAll('path')].some((p) =>
+						(p.getAttribute('d') ?? '').includes('5.5h8.5'),
+					)
+					if (!mineAlready) {
+						const originalSvg = trigger.querySelector('svg')
+						if (originalSvg !== null) {
+							const parent = originalSvg.parentElement
+							const nextSibling = originalSvg.nextSibling
+							parent.removeChild(originalSvg)
+							// 我们的图标用一个占位容器，方便整体移除。
+							const holder = document.createElement('span')
+							holder.style.display = 'contents'
+							parent.insertBefore(holder, nextSibling)
+							// 直接写 SVG 字符串：这里不在 React 树里，用 innerHTML 最省事，
+							// 也避免为了这一个图标去 require('react-dom')。
+							holder.innerHTML = LITE_ICON_SVG(16, 1.3)
+							touched.push({
+								restore() {
+									if (holder.parentElement !== null) holder.parentElement.removeChild(holder)
+									if (parent.isConnected && originalSvg.parentElement === null) {
+										parent.insertBefore(originalSvg, nextSibling)
+									}
+								},
+							})
+						} else {
+							// 图标还没渲染出来，下一轮再来。
+							done = false
+						}
 					}
 
 					// 2) 换文字：「设置」→「切至完整模式」。
 					const label = button.querySelector('[class*="triggerLabel"]')
-					if (label !== null) {
+					if (label === null) {
+						// 文字还没挂上，下一轮再来（实测首屏就是这种情况）。
+						done = false
+					} else if (label.textContent !== wantText) {
 						const originalText = label.textContent
-						label.textContent = pickLanguageText(t => t.liteSwitchToFull)
+						label.textContent = wantText
 						// 收起态下这个 label 是视觉隐藏的（DSH 用 clip 隐藏），交给 CSS 处理，
 						// 我们只换文字，不动它的显示方式。
 						touched.push({
@@ -676,27 +698,35 @@ window.__ModuleLoader__.load({
 					}
 
 					// 3) 无障碍名字也跟着走（否则读屏还念「设置」）。
-					const originalAria = button.getAttribute('aria-label')
-					button.setAttribute('aria-label', pickLanguageText(t => t.liteSwitchToFull))
-					// 4) 点击改成切换，而不是打开设置。
-					const originalClick = button.onclick
-					const handler = (event) => {
-						event.preventDefault()
-						event.stopPropagation()
-						toggleRef.current?.()
+					if (button.getAttribute('aria-label') !== wantText) {
+						const originalAria = button.getAttribute('aria-label')
+						button.setAttribute('aria-label', wantText)
+						touched.push({
+							restore() {
+								if (originalAria === null) button.removeAttribute('aria-label')
+								else button.setAttribute('aria-label', originalAria)
+							},
+						})
 					}
-					button.addEventListener('click', handler, true)
-					button.dataset.dshLiteSeat = '1'
-					touched.push({
-						restore() {
-							button.removeEventListener('click', handler, true)
-							delete button.dataset.dshLiteSeat
-							if (originalAria === null) button.removeAttribute('aria-label')
-							else button.setAttribute('aria-label', originalAria)
-							button.onclick = originalClick
-						},
-					})
-					return true
+
+					// 4) 点击改成切换，而不是打开设置。
+					if (button.dataset.dshLiteSeat !== '1') {
+						const handler = (event) => {
+							event.preventDefault()
+							event.stopPropagation()
+							toggleRef.current?.()
+						}
+						button.addEventListener('click', handler, true)
+						button.dataset.dshLiteSeat = '1'
+						touched.push({
+							restore() {
+								button.removeEventListener('click', handler, true)
+								delete button.dataset.dshLiteSeat
+							},
+						})
+					}
+
+					return done
 				}
 
 				/** 完整模式：在用户名那一行的最右侧放一个图标。 */

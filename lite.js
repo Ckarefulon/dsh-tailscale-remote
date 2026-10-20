@@ -161,9 +161,19 @@ export const LITE_HIDE = [
   'button[aria-label="收起右侧边栏"]',
   // 会话视图切换里那个「轨迹」页签。
   '[data-slot="conversation.view"][data-slot-id="trajectory"]',
-  // 「搜索会话」按钮（用户明确不要）。它连同自己那一格一起藏 —— 那一格
-  // `_9lTDKa_searchSlot` 占了整行的剩余宽度，只藏按钮会留下一片空白。
+  // 「工作区」那一行整行（用户：搜索不要、视图选项也不要，那行都可以删）。
+  // 它 = 「工作区」三个字 + 搜索按钮 + 视图选项按钮，高 36px；删掉之后会话列表
+  // 直接顶到侧边栏上沿，白赚 36px 的列表高度。
+  '[class*="_sectionHeader"]',
+  // 兜底：万一将来 DSH 把这行拆了/改了，「搜索会话」按钮本身也要藏。
+  //
+  // 为什么单独写一条：DSH 在**展开**和**收起**两种状态下用的是不同 DOM ——
+  //   展开：`.sectionHeader > .searchSlot > .search > .searchButton`
+  //   收起：`.root.rail      > .search      > .searchButton`  ← 没有 searchSlot
+  // 只藏外层容器的话，收起成竖条时那个搜索图标还会露出来（用户就是这么发现的）。
   '[class*="_searchSlot"]',
+  '[class*="_searchButton"]',
+  '[class*="_headerActions"]',
   // 输入框右边那个**上下文占用**指示器（`33%` 那个圆环，用户说不要）。
   // 它的 `aria-label` 是「上下文已用 N%」，是这个元素唯一稳定的语义锚点。
   '[aria-label^="上下文已用"]',
