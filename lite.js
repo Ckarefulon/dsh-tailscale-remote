@@ -174,14 +174,22 @@ export const LITE_HIDE = [
   '[class*="_searchSlot"]',
   '[class*="_searchButton"]',
   '[class*="_headerActions"]',
-  // 输入框右边那**两组**用量统计，用户都不要。DSH 把它们做成了两个独立的小组件，
-  // 所以必须分别藏（只藏一组的话另一组还在，用户就是这么发现「没删掉」的）：
+  // 输入框下方那一整行**用量统计**，用户不要。它现在装了两个小组件：
+  //   1. 活动徽章：`9 轮 1096 步 · 118 tok/s`（类名 `iq1doa_pill`）
+  //   2. 上下文圆环：`43%`（`aria-label` =「上下文已用 43%」）
   //
-  //   1. 上下文占用的小圆环（`33%`）：唯一稳定的锚点是 `aria-label` =「上下文已用 N%」。
-  //   2. 用量徽章那条（实测文本：`9 轮 1086 步 · 118 tok/s` 与 `277M tok · 缓存命中 98%`）：
-  //      类名 `iq1doa_pill` / `iq1doa_anchor`。它没有 aria-label，只能按类名片段认。
-  //      用 `[class*="iq1doa_"]` 这种**语义前缀**而不是全名 —— 前缀里的 hash 会随构建变，
-  //      但匹配不到时只是「多显示一条」，不会坏。
+  // 认它的**插槽名**而不是逐个猜类名：那一行就是 `conversation.composer.dock`
+  // 这个插槽的容器（实测 `<div class="RlGAzG_dock" data-composer-dock>` 里正好包着
+  // `<div data-slot="conversation.composer.dock" style="display: contents">`）。
+  // 按插槽名藏既稳又彻底 —— 将来 DSH 往里加第三个统计也一起藏掉。
+  //
+  // 实测代价/收益：整行 26px 高，藏掉后输入区从 128px 收到 102px，
+  // 输入卡与输入框完全不受影响（输入框仍可聚焦）。
+  '[data-slot="conversation.composer.dock"]',
+  // 还要把**外层包装** `[data-composer-dock]` 一起收掉：只藏插槽那份
+  // `display: contents` 的壳，外层 `div.RlGAzG_dock` 仍会留 4px 高度（实测）。
+  '[data-composer-dock]',
+  // 兜底：万一哪天那两个统计不再挂在 dock 插槽里，按它们自己的锚点也藏一次。
   '[aria-label^="上下文已用"]',
   '[aria-label^="Context used"]',
   '[class*="iq1doa_"]',
