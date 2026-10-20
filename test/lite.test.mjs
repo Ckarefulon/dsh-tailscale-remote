@@ -323,18 +323,26 @@ test('sidebar-right 仍会被图边带回来（不能从图里删，只能藏界
   assert.ok(lite.ids.includes('@deepseek-ai/dsh-client-ui-sidebar-right'), '它必须还在图里（否则 boot 审计会挂）')
 })
 
-test('rewriteIndex 注入隐藏样式，把设置入口 / 右侧栏 / 轨迹藏掉', () => {
+test('rewriteIndex 注入隐藏样式，把右侧栏 / 轨迹藏掉', () => {
   const lite = composeLiteGraph(sampleGraph())
   const result = rewriteIndex(sampleIndex(), { lite })
   assert.equal(result.changed, true)
 
   assert.ok(result.html.includes('<style data-dsh-tailscale-remote-hide>'), '必须注入隐藏样式')
-  assert.ok(result.html.includes('[data-slot="sidebar.settings"]'), '要藏设置入口')
   assert.ok(result.html.includes('[data-slot="rightbar"]'), '要藏右侧栏')
   assert.ok(result.html.includes('button[aria-label="打开右侧边栏"]'), '要藏右侧栏开关')
   assert.ok(result.html.includes('button[aria-label="收起右侧边栏"]'), '收起态也要藏')
   // 必须 display:none !important，否则 DSH 自己的类名优先级会盖过去。
-  assert.match(result.html, /\[data-slot="sidebar\.settings"\][^{]*\{display:none !important\}/)
+  assert.match(result.html, /\[data-slot="rightbar"\][^{]*\{display:none !important\}/)
+})
+
+test('**绝不**藏掉设置入口（那是手机上唯一能进设置页的地方）', () => {
+  const lite = composeLiteGraph(sampleGraph())
+  const result = rewriteIndex(sampleIndex(), { lite })
+  // `sidebar.settings` 是 single 插槽、由 ui-settings 注册在侧边栏底部；藏了之后
+  // 手机上就再也进不去设置页了。精简图标是加在旁边的，不是替换它。
+  assert.equal(result.html.includes('[data-slot="sidebar.settings"]'), false, '设置入口必须留着')
+  assert.equal(LITE_HIDE.includes('[data-slot="sidebar.settings"]'), false)
 })
 
 test('rewriteIndex 允许调用方传自己的隐藏列表（config.liteHide）', () => {

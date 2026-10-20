@@ -69,8 +69,8 @@ window.__ModuleLoader__.load({
 			phaseStarting: '还在启动中（拉起 Tailscale / 建立 Serve 路由）。',
 			phaseUnavailable: 'Tailscale 没在运行，远程访问暂时不可用。',
 			phaseError: '远程访问没能建起来。',
-			liteEnable: '切换到完整版（加载全部插件），刷新后生效',
-			liteDisable: '切换到精简版（只加载基础插件），刷新后生效',
+			liteEnable: '切至完整模式（加载全部插件），刷新后生效',
+			liteDisable: '切至精简模式（只加载基础插件），刷新后生效',
 		}
 
 		const EN = {
@@ -545,6 +545,9 @@ window.__ModuleLoader__.load({
 			const [state, setState] = useState(null)
 			const [busy, setBusy] = useState(false)
 
+			// 把图标钉到头像那一行的右侧。
+			usePinToAvatarRow()
+
 			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
 
 			const load = useCallback(async () => {
@@ -572,13 +575,19 @@ window.__ModuleLoader__.load({
 
 			// 桌面窗口：注册了也不渲染（双保险 —— apply 里其实一开始就不会注册）。
 			if (isDesktopWindow()) return null
-			// 只在精简页面上出现：完整模式下设置入口还在，用户从那里就能切回来。
-			const thisPageIsLite =
-				typeof globalThis !== 'undefined' && globalThis.__DSH_TAILSCALE_REMOTE_LITE__ === 'lite'
-			if (!thisPageIsLite) return null
+			// **精简版和完整版都显示**。原来只在精简页面上显示是错的：切到完整版之后
+			// 就再也找不到切回来的入口了（用户报的正是这个）。这个图标本身就是那个
+			// 「切回精简版」的入口，两个模式下都必须在。
 			if (state === null || state.liteAvailable !== true) return null
+			// 侧边栏收起成 56px 竖条时**只有头像**，不要这个图标。
+			// `wide` 是插槽 owner（ui-sidebar）真正传下来的 owner prop，实测渲染点是
+			// `renderSlot("sidebar.footer.action", { wide })`，收起时是 false。
+			if (props.wide === false) return null
 
-			const label = state.lite === true ? t.liteDisable : t.liteEnable
+			// 按钮说的是「点下去会发生什么」，所以跟着**当前状态的反面**走：
+			//   现在是精简版（lite=true） → 点它切到完整版 → 文案「切至完整模式」
+			//   现在是完整版（lite=false）→ 点它切到精简版 → 文案「切至精简模式」
+			const label = state.lite === true ? t.liteEnable : t.liteDisable
 			return h(
 				'button',
 				{
@@ -595,20 +604,154 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 注册这个插件的两处界面。
+		 * 把这一个图标**钉到头像那一行的右侧**。
 		 *
-		 * **桌面窗口里什么都不注册** —— 用户要求「电脑端一个字节都不准动」，所以整个
-		 * 插件在桌面 App 里是个纯 no-op：设置页没有那一行、侧边栏底部没有那个图标，
-		 * 桌面上看到的 DSH 与没装本插件时完全一致。
+		 * 为什么要动 DOM 位置：`sidebar.footer.action` 这个插槽的容器
+		 * （`_footerActions`）在**头像行的上方**、且默认左对齐（实测：容器的
+		 * `rect.top` 比头像行小 4px，宽度铺满、高度 0）。而用户要的是「头像栏居右」。
+		 * 换插槽也不行 —— 头像本身占着 `settings.launcher`，那是 **single** 插槽、
+		 * `replaceRisk: shadows-shipped-ui`，注册进去会整个盖掉 DSH 自带的账号菜单
+		 * （登录 / 退出登录 / 联系我们 / 设置入口全丢）。
+		 *
+		 * 做法：把**插槽容器**改成绝对定位、钉到头像行的垂直中线右侧。它本来是
+		 * `height: 0` 的空壳（里面只有我们这一个按钮），挪走它对宿主布局零影响。
+		 * 参照物选 `wCInkW_triggerRow`（头像行，实测 `position: relative`）。
+		 *
+		 * 判据用 `[class*="triggerRow"]` 与 `[class*="_footerActions"]` 这类**语义片段**
+		 * 而不是哈希全名 —— 哈希前缀是构建产物，DSH 一升级就变；片段匹配不到时
+		 * 图标就留在原位，功能照常，只是位置回到默认，不会坏。
+		 *
+		 * 只在这个页面（手机那半边）跑；桌面窗口根本走不到这里。
+		 */
+		function usePinToAvatarRow() {
+			useEffect(() => {
+				if (typeof document === 'undefined') return undefined
+				let host = null
+
+				const pin = () => {
+					// **注意**：`[data-slot="sidebar.footer.action"]` 本身是 `display: contents`
+					// 的空壳（实测 getBoundingClientRect() 宽高都是 0）。它的父容器
+					// `_footerActions` 有尺寸（256×28），但**宽度是铺满的** —— 平移整个容器
+					// 只能改垂直位置，水平方向它自己会重新铺满。
+					//
+					// 所以真正要挪的是**那个按钮本身**（我们的组件渲染出来的 button，
+					// 带 `data-dsh-tailscale-remote-lite` 标记）。它是 28×28 的定尺寸元素，
+					// transform 平移它最直接、也不影响宿主任何布局。
+					const button = document.querySelector('[data-dsh-tailscale-remote-lite]')
+					if (button === null) return
+					host = button
+					// 放不下就在原处别动：拿不到头像行就保持默认位置（功能不受影响）。
+					//
+					// 锚点顺序很重要：先找**头像按钮**（`aria-haspopup="menu"`，它的
+					// `aria-label` 由 DSH 的 locale 给出，是账号菜单那个按钮），再退到
+					// `triggerRow` 容器。为什么不能只认 triggerRow：一旦设置入口被别的东西
+					// 藏掉（例如旧版精简 CSS、或将来 DSH 改了结构），triggerRow 会变成
+					// 0×0，按它算出来的位置就全错。头像按钮自己在那一行里，尺寸也真实。
+					const anchor = document.querySelector('button[aria-haspopup="menu"]')
+					const row = anchor ?? document.querySelector('[class*="triggerRow"]')
+					if (row === null) return
+					// 先把可能残留的位移清掉，否则「当前 rect」已经是挪过的，会累加。
+					button.style.transform = ''
+					const hostRect = button.getBoundingClientRect()
+					const rowRect = row.getBoundingClientRect()
+					// 还没布局好（高度 0 / 都在 0,0）就下一轮再来，别钉到错误位置。
+					if (rowRect.height === 0 || hostRect.height === 0) {
+						button.dataset.dshPinned = ''
+						return
+					}
+					// 缓存键：行位置 + 行宽。展开/收起会把宽从 260 变 36，那时必须重钉。
+					const key = `${Math.round(rowRect.top)}|${Math.round(rowRect.width)}`
+					if (host.dataset.dshPinned === '1' && host.dataset.dshPinnedKey === key) {
+						// 已经钉在正确位置，恢复 transform 即可（上面刚清掉了）。
+						host.style.transform = host.dataset.dshPinnedShift ?? ''
+						return
+					}
+
+					// **不能用 absolute**：`footerActions` 的定位包含块是外层的 frame
+					// （实测 offsetParent 是 `BynINW_frame`，宽 1879px），absolute 会把它
+					// 甩到整个窗口右边去（实测偏移 1599px）。
+					//
+					// 改用**坐标平移**：先量出它当前在哪、头像行该在哪，再用 transform 挪过去。
+					// transform 不参与布局、也不受包含块影响，所以位置是确定的。
+					// 目标：贴头像行右边缘内侧 10px，垂直居中。
+					const targetRight = rowRect.right - 10
+					const targetCenterY = rowRect.top + rowRect.height / 2
+					const dx = Math.round(targetRight - hostRect.right)
+					const dy = Math.round(targetCenterY - (hostRect.top + hostRect.height / 2))
+					const shift = `translate(${dx}px, ${dy}px)`
+					button.style.transform = shift
+					button.style.zIndex = '1'
+					button.dataset.dshPinned = '1'
+					button.dataset.dshPinnedKey = key
+					button.dataset.dshPinnedShift = shift
+				}
+
+				pin()
+				// 侧边栏展开/收起、进入设置页都会重建这一块 DOM，所以要跟着重钉。
+				// 没有 MutationObserver 的环境（node 测试夹具）就只钉一次 —— 位置可能
+				// 在重建后回到默认，但功能不受影响，不会抛错。
+				const cleanup = () => {
+					if (host !== null && host.dataset.dshPinned === '1') {
+						host.removeAttribute('style')
+						delete host.dataset.dshPinned
+						delete host.dataset.dshPinnedKey
+						delete host.dataset.dshPinnedShift
+					}
+				}
+				if (typeof MutationObserver !== 'function') return cleanup
+
+				// **首屏可能还没布局好**（实测 pin() 第一次跑时行高还是 0），而
+				// MutationObserver 只在 DOM 变化时触发、首屏渲染完就不再有变化了。
+				// 所以补一个「重试到成功为止」的循环：每帧试一次，最多 300 帧（约 5 秒）。
+				// 一旦钉成功就停，不留常驻定时器。精简版页面比完整版慢（要等合并脚本
+				// 下载并注册完），所以这个窗口要给够。
+				let tries = 0
+				let frame = 0
+				const retry = () => {
+					if (host !== null && host.dataset.dshPinned === '1') return
+					if (tries++ > 300) return
+					pin()
+					frame = requestAnimationFrame(retry)
+				}
+				if (typeof requestAnimationFrame === 'function') frame = requestAnimationFrame(retry)
+
+				// 布局稳定后再补一次（resize / 字体加载完都可能改变行位置）。
+				const onResize = () => pin()
+				if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+					window.addEventListener('resize', onResize)
+				}
+
+				const observer = new MutationObserver(() => pin())
+				observer.observe(document.body, { childList: true, subtree: true })
+				return () => {
+					observer.disconnect()
+					if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+						window.removeEventListener('resize', onResize)
+					}
+					if (frame !== 0 && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame)
+					cleanup()
+				}
+			}, [])
+		}
+
+		/**
+		 * 注册这个插件的界面。
+		 *
+		 * 两处，规则不同：
+		 *
+		 *   1. **设置页那一行（手机连接 + 换密钥）** —— 条件注册，桌面与手机**都有**。
+		 *      这是插件原本就有的功能，不是这次新加的东西，任何时候都不该消失。
+		 *
+		 *   2. **侧边栏底部的精简/完整图标** —— 只在**手机的远程页面**上出现。
+		 *      桌面窗口里不注册、完整模式页面里也不渲染（见 LiteSwitch）。
 		 *
 		 * 用 `slots.inject` 而不是 `slots.register` 直调：插槽由别的包声明，它和本包的
 		 * 激活顺序没有保证。
 		 * @param ctx - 客户端根上下文。
 		 */
 		function apply(ctx) {
-			if (isDesktopWindow()) return
-
-			// 设置页那一行：手机链接 + 换密钥。
+			// 设置页那一行：桌面和手机都注册（原本就有的功能，不能因为「精简模式只在
+			// 远程端」而被连带删掉）。
 			ctx.slots.inject('settings.general.item', () =>
 				ctx.slots.register(
 					{
@@ -622,7 +765,10 @@ window.__ModuleLoader__.load({
 					RemoteRow,
 				),
 			)
-			// 侧边栏底部的精简/完整开关图标：精简页面上它顶替被藏掉的设置入口。
+
+			// 侧边栏底部的精简/完整图标：**只**在手机的远程页面上有。
+			// 桌面窗口里直接不注册 —— 用户要求桌面端一个字节都不动。
+			if (isDesktopWindow()) return
 			ctx.slots.inject('sidebar.footer.action', () =>
 				ctx.slots.register(
 					{

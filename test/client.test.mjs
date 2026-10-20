@@ -542,15 +542,19 @@ describe('底部那个精简/完整开关图标', () => {
     }
   }
 
-  /** 渲染出那个底部图标（精简页面 + lite 可用）。 */
+  /** 渲染出那个底部图标。`state` 覆盖状态端点返回的 lite 字段，`extraProps` 是插槽 owner props。 */
   async function renderIcon(overrides = {}) {
+    const liteState = overrides.state ?? { lite: true, liteAvailable: true }
     const fetchImpl = async (path) => {
       if (path === '/api/dsh-tailscale-remote/state') {
-        return { status: 200, json: async () => ({ ok: true, lite: true, liteAvailable: true, liteCount: 30 }) }
+        return { status: 200, json: async () => ({ ok: true, liteCount: 30, ...liteState }) }
       }
-      return { status: 200, json: async () => ({ ok: true, lite: true }) }
+      return { status: 200, json: async () => ({ ok: true, lite: liteState.lite }) }
     }
-    const { registrations, renderer } = applyAndCollect({ fetch: fetchImpl, ...overrides })
+    // 注意：state/extraProps 是本辅助函数自己的参数，不能透给 applyAndCollect。
+    const { state: _ignoredState, extraProps, ...rest } = overrides
+    void _ignoredState
+    const { registrations, renderer } = applyAndCollect({ ...rest, fetch: fetchImpl })
     const footer = registrations
       .filter((r) => r.kind === 'slots.inject')
       .find((r) => r.name === 'sidebar.footer.action')
@@ -559,7 +563,8 @@ describe('底部那个精简/完整开关图标', () => {
       (r) => r.kind === 'slots.register' && r.definition.name === 'sidebar.footer.action',
     )
     assert.ok(registration !== undefined, '必须先注册到底部插槽')
-    const props = registration.definition.inject()
+    // 插槽 owner 真正会传下来的 props（ui-sidebar 的 renderSlot(..., { wide })）。
+    const props = { ...registration.definition.inject(), ...(extraProps ?? { wide: true }) }
     renderer.render(registration.component, props)
     await renderer.flush()
     const tree = renderer.render(registration.component, props)
@@ -568,7 +573,7 @@ describe('底部那个精简/完整开关图标', () => {
   }
 
   it('画的是 16×16 SVG 图标，没有可见文字（用户要求这一处用图标）', async () => {
-    const tree = await renderIcon({ window: { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' } })
+    const tree = await renderIcon({ window: { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' }, extraProps: { wide: true } })
     const buttons = findAll(tree, (node) => node.type === 'button')
     assert.equal(buttons.length, 1, '应当渲染出一个图标按钮')
     const button = buttons[0]
@@ -590,10 +595,26 @@ describe('底部那个精简/完整开关图标', () => {
     assert.ok(typeof button.props.title === 'string' && button.props.title.length > 0)
   })
 
-  it('完整模式页面里不渲染（那时原生设置入口还在，用不着它）', async () => {
-    // window 上**没有** LITE 标记 = 完整版页面。
-    const tree = await renderIcon({ window: {} })
-    assert.equal(findAll(tree, (node) => node.type === 'button').length, 0, '完整版页面不该有这个图标')
+  it('**完整模式页面里也要有**（否则切过去就再也切不回来了）', async () => {
+    // window 上**没有** LITE 标记 = 完整版页面；lite 状态是 false。
+    const tree = await renderIcon({
+      window: {},
+      extraProps: { wide: true },
+      state: { lite: false, liteAvailable: true },
+    })
+    const buttons = findAll(tree, (node) => node.type === 'button')
+    assert.equal(buttons.length, 1, '完整版页面上必须也有这个图标，否则没有切回精简版的入口')
+
+    // 按钮语义要跟着走：完整模式下点它是「切至精简模式」。
+    const button = buttons[0]
+    const label = button.props['aria-label']
+    assert.ok(label.includes('精简'), `完整模式的按钮应说切至精简，实际：${label}`)
+    assert.equal(textOf(button).join('').trim(), '', '仍然不该有可见文字')
+  })
+
+  it('侧边栏收起（wide=false）时只有头像，不渲染这个图标', async () => {
+    const tree = await renderIcon({ window: { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' }, extraProps: { wide: false } })
+    assert.equal(findAll(tree, (node) => node.type === 'button').length, 0, '收起态不该有图标')
   })
 })
 describe('换密钥', () => {
@@ -810,12 +831,20 @@ describe('换密钥', () => {
 })
 
 describe('桌面端一个字节都不准动', () => {
-  it('桌面窗口（有 dshDesktopBoot）里 apply 什么都不注册', () => {
+  it('桌面窗口（有 dshDesktopBoot）里**原有的设置条目照旧注册**', () => {
     // `dshDesktopBoot` 只由 Electron preload 用 contextBridge 注入；有它 = 桌面窗口。
+    // 关键：设置页那一行（手机连接 + 换密钥）是这个插件**原本就有**的功能，
+    // 「精简模式只在远程端」绝不能把它连带删掉 —— 那是删掉既有功能，不是「不加字节」。
     const { registrations } = applyAndCollect({ window: { dshDesktopBoot: { ready: async () => ({}) } } })
     const injects = registrations.filter((r) => r.kind === 'slots.inject')
-    assert.equal(injects.length, 0, '桌面里必须一个插槽都不注入')
-    assert.equal(registrations.length, 0, '桌面里不该产生任何注册动作')
+    assert.equal(injects.length, 1, '桌面里只注册设置页那一行')
+    assert.equal(injects[0].name, 'settings.general.item', '桌面也必须保留手机连接那一行')
+  })
+
+  it('桌面窗口里**不注册**精简模式图标（那是新增的，只在远程端）', () => {
+    const { registrations } = applyAndCollect({ window: { dshDesktopBoot: { ready: async () => ({}) } } })
+    const footer = registrations.filter((r) => r.kind === 'slots.inject').find((r) => r.name === 'sidebar.footer.action')
+    assert.equal(footer, undefined, '桌面窗口里不该有那个图标')
   })
 
   it('手机页面（没有 dshDesktopBoot）里照常注册', () => {

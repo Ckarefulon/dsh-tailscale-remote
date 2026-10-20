@@ -139,11 +139,13 @@ export const LITE_SERVICE_KEEP = [
  *
  * **只在这份（手机的）页面上生效** —— 桌面窗口走的是另一条渲染路径，一个字节都
  * 不经过这里。
+ *
+ * 注意**不能藏** `sidebar.settings`：那是 `ui-settings` 注册在侧边栏底部的**唯一**
+ * 设置入口（`sidebar.settings` 是 `single` 插槽，旁边没有第二个），藏掉之后手机上
+ * 就再也进不去设置页了 —— 而设置里有账号、模型、插件等一堆东西。精简模式那个图标
+ * 是加在它**旁边**的 `sidebar.footer.action` 里，不是替换它。
  */
 export const LITE_HIDE = [
-  // 设置入口：用户要求把这里换成「精简 / 完整」开关（那个图标由本插件自己注册到
-  // sidebar.footer.action，所以藏掉原生的设置按钮不影响我们自己那一格）。
-  '[data-slot="sidebar.settings"]',
   // 右侧栏：连同它的开关按钮（按钮没有 data-slot，只能按 aria-label 定位）。
   '[data-slot="rightbar"]',
   'button[aria-label="打开右侧边栏"]',
