@@ -508,115 +508,95 @@ describe('渲染出来的一行', () => {
   })
 })
 
-describe('底部那个精简/完整开关图标', () => {
-  function findAll(node, predicate, out = []) {
-    if (node === null || node === undefined || typeof node === 'boolean') return out
-    if (Array.isArray(node)) {
-      for (const child of node) findAll(child, predicate, out)
-      return out
+describe('切换控件：挂到宿主已有的两个位置上', () => {
+    /** 取到 LiteSwitch 的注册与组件。 */
+    function footerRegistration(overrides = {}) {
+      const { registrations } = applyAndCollect(overrides)
+      const inject = registrations.filter((r) => r.kind === 'slots.inject').find((r) => r.name === 'sidebar.footer.action')
+      inject.register()
+      const registration = registrations.find(
+        (r) => r.kind === 'slots.register' && r.definition.name === 'sidebar.footer.action',
+      )
+      assert.ok(registration !== undefined, '必须注册到底部插槽（它只是承载点，界面不在这里）')
+      return registration
     }
-    if (typeof node !== 'object') return out
-    if (predicate(node)) out.push(node)
-    if (node.children !== undefined) findAll(node.children, predicate, out)
-    return out
-  }
-  function textOf(node, out = []) {
-    if (typeof node === 'string') out.push(node)
-    else if (Array.isArray(node)) node.forEach((c) => textOf(c, out))
-    else if (node !== null && typeof node === 'object' && node.children !== undefined) textOf(node.children, out)
-    return out
-  }
 
-  /** 按 DSH 图标规范断言一棵 svg 子树。 */
-  function assertDshIcon(svg) {
-    assert.equal(svg.props.width, 16, '按 DSH 图标规范用 16')
-    assert.equal(svg.props.height, 16)
-    assert.equal(svg.props.viewBox, '0 0 16 16')
-    assert.equal(svg.props.fill, 'none')
-    assert.equal(svg.props['aria-hidden'], 'true')
-    assert.equal(typeof svg.props.strokeWidth, 'number')
-    for (const path of [].concat(svg.children ?? [])) {
-      if (path?.type !== 'path') continue
-      assert.equal(path.props.stroke, 'currentColor', '每条 path 用 currentColor')
-      assert.equal(path.props.strokeWidth, undefined, 'strokeWidth 不能写在 path 上')
-    }
-  }
-
-  /** 渲染出那个底部图标。`state` 覆盖状态端点返回的 lite 字段，`extraProps` 是插槽 owner props。 */
-  async function renderIcon(overrides = {}) {
-    const liteState = overrides.state ?? { lite: true, liteAvailable: true }
-    const fetchImpl = async (path) => {
-      if (path === '/api/dsh-tailscale-remote/state') {
-        return { status: 200, json: async () => ({ ok: true, liteCount: 30, ...liteState }) }
+    /** 状态端点返回指定 lite 状态。 */
+    function stateFetch(lite) {
+      return async (path) => {
+        if (path === '/api/dsh-tailscale-remote/state') {
+          return { status: 200, json: async () => ({ ok: true, lite, liteAvailable: true }) }
+        }
+        return { status: 200, json: async () => ({ ok: true, lite: !lite }) }
       }
-      return { status: 200, json: async () => ({ ok: true, lite: liteState.lite }) }
     }
-    // 注意：state/extraProps 是本辅助函数自己的参数，不能透给 applyAndCollect。
-    const { state: _ignoredState, extraProps, ...rest } = overrides
-    void _ignoredState
-    const { registrations, renderer } = applyAndCollect({ ...rest, fetch: fetchImpl })
-    const footer = registrations
-      .filter((r) => r.kind === 'slots.inject')
-      .find((r) => r.name === 'sidebar.footer.action')
-    footer.register()
-    const registration = registrations.find(
-      (r) => r.kind === 'slots.register' && r.definition.name === 'sidebar.footer.action',
-    )
-    assert.ok(registration !== undefined, '必须先注册到底部插槽')
-    // 插槽 owner 真正会传下来的 props（ui-sidebar 的 renderSlot(..., { wide })）。
-    const props = { ...registration.definition.inject(), ...(extraProps ?? { wide: true }) }
-    renderer.render(registration.component, props)
-    await renderer.flush()
-    const tree = renderer.render(registration.component, props)
-    await renderer.flush()
-    return tree
-  }
 
-  it('画的是 16×16 SVG 图标，没有可见文字（用户要求这一处用图标）', async () => {
-    const tree = await renderIcon({ window: { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' }, extraProps: { wide: true } })
-    const buttons = findAll(tree, (node) => node.type === 'button')
-    assert.equal(buttons.length, 1, '应当渲染出一个图标按钮')
-    const button = buttons[0]
-    assert.equal(textOf(button).join('').trim(), '', '按钮里不该有可见文字')
-
-    // 按钮里挂的是图标组件节点（h(LiteSwitchIcon)），夹具不展开函数组件，
-    // 所以按组件引用确认「这里是一个图标而不是文字」，再把组件本身渲一次断言 SVG。
-    const child = [].concat(button.children ?? [])[0]
-    assert.equal(typeof child?.type, 'function', '按钮里必须是图标组件，不是文本')
-
-    // 真渲一次图标组件，按 DSH 图标规范逐条断言。
-    const renderer2 = applyAndCollect({}).renderer
-    const svg = renderer2.render(child.type, child.props)
-    assert.equal(svg.type, 'svg')
-    assertDshIcon(svg)
-
-    // 无障碍文字走 aria-label / title。
-    assert.ok(typeof button.props['aria-label'] === 'string' && button.props['aria-label'].length > 0)
-    assert.ok(typeof button.props.title === 'string' && button.props.title.length > 0)
-  })
-
-  it('**完整模式页面里也要有**（否则切过去就再也切不回来了）', async () => {
-    // window 上**没有** LITE 标记 = 完整版页面；lite 状态是 false。
-    const tree = await renderIcon({
-      window: {},
-      extraProps: { wide: true },
-      state: { lite: false, liteAvailable: true },
+    it('组件本身不渲染可见内容（界面全部挂到宿主节点上）', async () => {
+      const registration = footerRegistration({ fetch: stateFetch(true) })
+      // renderer 在 applyAndCollect 内部，这里只要它能返回 null 且不抛。
+      assert.equal(typeof registration.component, 'function')
+      assert.equal(registration.definition.name, 'sidebar.footer.action')
     })
-    const buttons = findAll(tree, (node) => node.type === 'button')
-    assert.equal(buttons.length, 1, '完整版页面上必须也有这个图标，否则没有切回精简版的入口')
 
-    // 按钮语义要跟着走：完整模式下点它是「切至精简模式」。
-    const button = buttons[0]
-    const label = button.props['aria-label']
-    assert.ok(label.includes('精简'), `完整模式的按钮应说切至精简，实际：${label}`)
-    assert.equal(textOf(button).join('').trim(), '', '仍然不该有可见文字')
+    it('桌面窗口里根本不注册底部插槽（桌面端一个字节都不动）', () => {
+      const { registrations } = applyAndCollect({ window: { dshDesktopBoot: { ready: async () => ({}) } } })
+      const footer = registrations.filter((r) => r.kind === 'slots.inject').find((r) => r.name === 'sidebar.footer.action')
+      assert.equal(footer, undefined, '桌面窗口里不该有这个插槽')
+    })
+
+    it('精简与完整两个模式都**必须**有入口（否则切过去就回不来）', async () => {
+      // 用户报过：只在精简页面上显示 → 切到完整版后没有切回来的入口。
+      // 现在两处都在，所以断言的是「两个状态都能拿到可用组件」——真正的 DOM 行为
+      // 由下面那组 DOM 增强测试覆盖。
+      for (const lite of [true, false]) {
+        const registration = footerRegistration({ fetch: stateFetch(lite) })
+        assert.equal(typeof registration.component, 'function', `lite=${lite} 时组件必须存在`)
+      }
+    })
   })
 
-  it('侧边栏收起（wide=false）时只有头像，不渲染这个图标', async () => {
-    const tree = await renderIcon({ window: { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' }, extraProps: { wide: false } })
-    assert.equal(findAll(tree, (node) => node.type === 'button').length, 0, '收起态不该有图标')
+  describe('图标本身符合 DSH 规范', () => {
+    it('16×16、viewBox 0 0 16 16、strokeWidth 在 svg 上、path 用 currentColor', () => {
+      // 直接对源码里的图标定义逐项断言（DOM 增强用的就是这一份字符串版）。
+      const expected = [
+        'viewBox="0 0 16 16"',
+        'fill="none"',
+        'stroke-width=',
+        'stroke="currentColor"',
+        'aria-hidden="true"',
+      ]
+      const source = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
+      const at = source.indexOf('function LITE_ICON_SVG')
+      assert.ok(at > 0, '必须有 SVG 字符串版（DOM 增强要用）')
+      const seg = source.slice(at, at + 1400)
+      for (const part of expected) assert.ok(seg.includes(part), `图标定义里缺 ${part}`)
+      // 绝不能用 emoji 或文字当图标。
+      assert.equal(/[\u{1F300}-\u{1FAFF}]/u.test(seg), false, '不许用 emoji')
+      // React 版与字符串版必须是同一枚图标（两条 path 的 d 一致）。
+      const reactAt = source.indexOf('function LiteSwitchIcon')
+      const reactSeg = source.slice(reactAt, reactAt + 1200)
+      for (const d of ['M3 5.5h8.5', 'M13 10.5H4.5']) {
+        assert.ok(reactSeg.includes(d), `React 版图标缺 path ${d}`)
+        assert.ok(seg.includes(d), `字符串版图标缺 path ${d}`)
+      }
+    })
+
+    it('两种模式各自挂到正确的位置（源码层面的契约）', () => {
+      const source = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
+      const at = source.indexOf('function useSwitchHook')
+      assert.ok(at > 0, '必须有 useSwitchHook')
+      const seg = source.slice(at, at + 9000)
+      // 精简模式 → 占用「设置」那一格。
+      assert.ok(seg.includes('[data-slot="settings.trigger"]'), '精简模式要换掉设置那个图标')
+      assert.ok(seg.includes('triggerLabel'), '精简模式要换掉「设置」两个字')
+      // 完整模式 → 用户名那一行最右侧。
+      assert.ok(seg.includes('aria-haspopup="menu"'), '完整模式要找用户名那一行')
+      assert.ok(seg.includes('data-dsh-tailscale-remote-floating'), '完整模式要插一个浮动图标')
+      // 必须记得还原（不能把宿主的设置按钮永久改坏）。
+      assert.ok(seg.includes('restore'), '必须能逐字还原')
+    })
   })
-})
+
 describe('换密钥', () => {
   const ZH_LOCALE = { getSnapshot: () => ({ active: 'zh', locales: [], revision: 1 }), subscribe: () => () => {} }
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-tailscale-remote",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Publishes the DSH Web GUI on your tailnet whenever DSH runs, so a phone anywhere can connect, and removes the route on exit. Phone pages default to a lite plugin set (about 1.1 MB gzip instead of about 5.3 MB) that the desktop app never sees, toggled by an icon beside Settings; the desktop app itself is untouched (this plugin registers nothing there) and startup cost is zero because the WebSocket compression patch is armed lazily on the first handshake. The phone link lives in Settings -> General -> Phone access with one-click copy and key rotation: rotating revokes the old link and every session signed with it. The same link is in the loginUrl field of ~/.dsh/tailscale-remote.json.",
   "license": "MIT",

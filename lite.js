@@ -96,6 +96,10 @@ export const LITE_SEEDS = [
   '@deepseek-ai/dsh-typert-registry',
   '@deepseek-ai/dsh-client-ui-theme',
   '@deepseek-ai/dsh-client-ui-layout',
+  // 左上角那个 DeepSeek 图形字标（`sidebar.brand.name`）。只占 868 字节 gzip，
+  // 但少了它牌子就退化成纯文本「DSH 本地构建」，看起来像坏了 —— 不值得为这点
+  // 体积牺牲第一眼的正确性。
+  '@deepseek-ai/dsh-client-ui-brand-official',
   '@deepseek-ai/dsh-client-ui-sidebar',
   '@deepseek-ai/dsh-client-ui-session',
   '@deepseek-ai/dsh-client-ui-workspace',
