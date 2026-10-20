@@ -183,8 +183,14 @@ window.__ModuleLoader__.load({
 				color: '#fff',
 			},
 			hint: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary,#6b7280)' },
-			// 侧边栏底部那个图标按钮：28px 见方，与宿主自己那几个图标按钮同尺寸同重量。
-			iconButton: {
+			/**
+			 * 侧边栏底部那个「精简 / 完整」切换按钮。
+			 *
+			 * 只有图标、没有文字（用户明确要求这一处用图标）。28px 见方，与宿主
+			 * 自己那几个图标按钮同尺寸；颜色走主题变量，深浅色自动跟随，变量缺失时
+			 * 退回一个中性灰，界面仍然可读。
+			 */
+			footerSwitch: {
 				display: 'flex',
 				alignItems: 'center',
 				justifyContent: 'center',
@@ -197,13 +203,6 @@ window.__ModuleLoader__.load({
 				color: 'var(--dsw-alias-label-secondary,#6b7280)',
 				cursor: 'pointer',
 				flex: 'none',
-			},
-			liteBox: {
-				display: 'flex',
-				flexDirection: 'column',
-				gap: 8,
-				paddingTop: 12,
-				borderTop: '.5px solid var(--dsw-alias-border-l2,#e5e7eb)',
 			},
 			warn: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-state-warn-primary,#b45309)' },
 			error: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-state-error-primary,#dc2626)' },
@@ -573,282 +572,48 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 把「切换精简 / 完整」这个动作**挂到宿主已有的那两个位置上**。
+		 * 「精简 / 完整」切换控件。
 		 *
-		 * 用户要的效果（原话）：
-		 *   - **精简模式**下：把侧边栏左下角那个「设置」**换成**切换控件 ——
-		 *     设置图标的位置变成切换图标，「设置」两个字变成「切至完整模式」。
-		 *   - **完整模式**下：那一栏照旧是设置，**另外**在用户名那一行的最右侧放一个图标。
+		 * ## 它长在哪儿（这是整个设计里唯一定死的决定）
 		 *
-		 * 为什么不能靠插槽做到：
-		 *   - 「设置」那一格是 `settings.launcher` / `settings.trigger`，两者都是 **single**
-		 *     插槽且 `replaceRisk: shadows-shipped-ui`。注册进去会**整个盖掉** DSH 的设置
-		 *     按钮（连点击打开设置一起没了）—— 那是既有功能，不能动。
-		 *   - 「用户名那一行」是 `settings.launcher` 里的账号按钮，同样被占。
+		 * 它长在 **`sidebar.footer.action`** 插槽里 —— 侧边栏最底下、设定那一行
+		 * 所在的那个脚区，由 `ui-sidebar` 声明。
 		 *
-		 * 所以走 **DOM 增强**：在宿主渲染出来的节点上就地改内容 / 追加一个兄弟节点。
-		 * 每步都能失败、失败就保持原样（功能不变，只是没有这个开关）。
+		 * 为什么必须是这里，而不是别的地方：
 		 *
-		 * 具体两件事：
-		 *   1. 精简模式下，把 `[data-slot="settings.trigger"]` 里的 svg 换成我们的图标，
-		 *      把 `.triggerLabel` 的文字换成「切至完整模式」；点这一格 → 切到完整模式。
-		 *   2. 完整模式下，在账号按钮（`aria-haspopup="menu"`）所在行的最右侧插入图标，
-		 *      点它 → 切到精简模式。
+		 *   1. **它有自己的一格，不寄生任何别人的按钮。** 我早先几版把它挂到 DSH 的
+		 *      设置按钮上（换它的图标/文字、接管它的点击）。那种做法要求设置按钮
+		 *      必须存在 —— 而设置按钮是 `ui-settings-general` 注册的，恰好就是
+		 *      「精简模式不该传的那个组件」。于是「不传那个组件」和「有个切换按钮」
+		 *      直接互相打架：包一抽掉，按钮跟着没了。**这是之前那些 bug 的总根因。**
+		 *   2. `ui-sidebar` 的 `inject` 是 `["slots","layout","uiWorkspace","locale",
+		 *      "shortcuts"]` —— **不含** `ui-settings-general`，所以在精简图里它也
+		 *      一定在，座位一定存在。
 		 *
-		 * 恢复：一旦离开该模式 / 组件卸载，把改过的东西**逐字还原**（记下原始 svg 与文字）。
-		 * @param state - 状态端点给的 `{ lite, liteAvailable }`；null 表示还没拿到。
-		 * @param onToggle - 点击时要执行的动作。
-		 */
-		function useSwitchHook(state, onToggle) {
-			// onToggle 每次渲染都是新函数，用 ref 存着，避免 effect 反复重跑。
-			const toggleRef = useRef(onToggle)
-			toggleRef.current = onToggle
-			const lite = state?.lite
-			const available = state?.liteAvailable === true
-
-			useEffect(() => {
-				if (typeof document === 'undefined') return undefined
-				if (!available) return undefined
-
-				/** 记下被我们改过的节点，卸载时逐字还原。 */
-				const touched = []
-				let injected = null
-
-				const restoreAll = () => {
-					for (const entry of touched) {
-						try {
-							entry.restore()
-						} catch {
-							/* 节点可能已经没了，忽略 */
-						}
-					}
-					touched.length = 0
-					if (injected !== null && injected.parentElement !== null) {
-						injected.parentElement.removeChild(injected)
-					}
-					injected = null
-				}
-
-				/**
-				 * 精简模式：把「设置」那一格换成切换控件。
-				 *
-				 * **必须幂等**：React 会随时重建这一块 DOM（展开/收起、语言切换、
-				 * 设置页开关都会触发），而且图标与文字**不是同时挂上**的 —— 实测
-				 * 第一次跑到这里时图标在、label 还没渲染出来。所以每次 sync 都要来
-				 * 这里补齐，只补缺的那部分，不去重复改已经改好的。
-				 * @returns 是否已经全部处理完。
-				 */
-				const hookSettingsSeat = () => {
-					const trigger = document.querySelector('[data-slot="settings.trigger"]')
-					const button = trigger?.closest('button')
-					if (trigger === undefined || trigger === null || button === null) return false
-
-					const wantText = pickLanguageText((dict) => dict.liteSwitchToFull)
-					let done = true
-
-					// 1) 换图标：把原来的 svg 摘下来存好，塞我们的。
-					//    判据是「里头有没有我们那两条 path」而不是「有没有标记」——
-					//    React 重建会把我塞的 span 连同标记一起丢掉，但标记在 button 上
-					//    会留下来，用标记判断就会漏掉重建后的那一份。
-					const mineAlready = [...trigger.querySelectorAll('path')].some((p) =>
-						(p.getAttribute('d') ?? '').includes('5.5h8.5'),
-					)
-					if (!mineAlready) {
-						const originalSvg = trigger.querySelector('svg')
-						if (originalSvg !== null) {
-							const parent = originalSvg.parentElement
-							const nextSibling = originalSvg.nextSibling
-							parent.removeChild(originalSvg)
-							// 我们的图标用一个占位容器，方便整体移除。
-							const holder = document.createElement('span')
-							holder.style.display = 'contents'
-							parent.insertBefore(holder, nextSibling)
-							// 直接写 SVG 字符串：这里不在 React 树里，用 innerHTML 最省事，
-							// 也避免为了这一个图标去 require('react-dom')。
-							holder.innerHTML = LITE_ICON_SVG(16, 1.3)
-							touched.push({
-								restore() {
-									if (holder.parentElement !== null) holder.parentElement.removeChild(holder)
-									if (parent.isConnected && originalSvg.parentElement === null) {
-										parent.insertBefore(originalSvg, nextSibling)
-									}
-								},
-							})
-						} else {
-							// 图标还没渲染出来，下一轮再来。
-							done = false
-						}
-					}
-
-					// 2) 换文字：「设置」→「切至完整模式」。
-					const label = button.querySelector('[class*="triggerLabel"]')
-					if (label === null) {
-						// 文字还没挂上，下一轮再来（实测首屏就是这种情况）。
-						done = false
-					} else if (label.textContent !== wantText) {
-						const originalText = label.textContent
-						label.textContent = wantText
-						// 收起态下这个 label 是视觉隐藏的（DSH 用 clip 隐藏），交给 CSS 处理，
-						// 我们只换文字，不动它的显示方式。
-						touched.push({
-							restore() {
-								if (label.isConnected) label.textContent = originalText
-							},
-						})
-					}
-
-					// 3) 无障碍名字也跟着走（否则读屏还念「设置」）。
-					if (button.getAttribute('aria-label') !== wantText) {
-						const originalAria = button.getAttribute('aria-label')
-						button.setAttribute('aria-label', wantText)
-						touched.push({
-							restore() {
-								if (originalAria === null) button.removeAttribute('aria-label')
-								else button.setAttribute('aria-label', originalAria)
-							},
-						})
-					}
-
-					// 4) 点击改成切换，而不是打开设置。
-					if (button.dataset.dshLiteSeat !== '1') {
-						const handler = (event) => {
-							event.preventDefault()
-							event.stopPropagation()
-							toggleRef.current?.()
-						}
-						button.addEventListener('click', handler, true)
-						button.dataset.dshLiteSeat = '1'
-						touched.push({
-							restore() {
-								button.removeEventListener('click', handler, true)
-								delete button.dataset.dshLiteSeat
-							},
-						})
-					}
-
-					return done
-				}
-
-				/** 完整模式：在用户名那一行的最右侧放一个图标。 */
-				const hookAccountRow = () => {
-					const accountButton = document.querySelector('button[aria-haspopup="menu"]')
-					if (accountButton === null) return false
-					// 往上找**真正有尺寸**的那一层当容器。实测这条链路上有若干
-					// `display: contents` 的空壳（宽高为 0），按固定层数取会拿到空壳，
-					// 于是宽度检查永远不通过、图标插不进去。
-					let row = accountButton.parentElement
-					while (row !== null && row !== document.body) {
-						const rect = row.getBoundingClientRect()
-						if (rect.width >= 80 && rect.height > 0) break
-						row = row.parentElement
-					}
-					if (row === null || row === document.body) return false
-					if (document.querySelector('[data-dsh-tailscale-remote-floating]') !== null) {
-						return true
-					}
-
-					const button = document.createElement('button')
-					button.type = 'button'
-					button.setAttribute('data-dsh-tailscale-remote-floating', '')
-					button.setAttribute('aria-label', pickLanguageText((t) => t.liteSwitchToLite))
-					button.title = pickLanguageText((t) => t.liteSwitchToLite)
-					button.style.cssText = [
-						'position:absolute',
-						'right:10px',
-						'top:50%',
-						'transform:translateY(-50%)',
-						'width:28px',
-						'height:28px',
-						'display:flex',
-						'align-items:center',
-						'justify-content:center',
-						'padding:0',
-						'border:none',
-						'background:transparent',
-						'color:var(--dsw-alias-label-secondary,#6b7280)',
-						'cursor:pointer',
-						'z-index:2',
-						'border-radius:var(--dsw-radius-sm,8px)',
-					].join(';')
-					button.innerHTML = LITE_ICON_SVG(16, 1)
-					button.addEventListener('click', (event) => {
-						event.preventDefault()
-						event.stopPropagation()
-						toggleRef.current?.()
-					})
-					// 行本身要能当定位参照（实测是 position: relative，这里兜底）。
-					if (getComputedStyle(row).position === 'static') row.style.position = 'relative'
-					row.appendChild(button)
-					injected = button
-					return true
-				}
-
-				/** 按当前模式执行对应那一件事；顺手把另一件撤掉。 */
-				const sync = () => {
-					if (lite === true) {
-						// 精简模式：占用设置那一格。先把完整模式那个浮动图标撤掉。
-						if (injected !== null && injected.parentElement !== null) {
-							injected.parentElement.removeChild(injected)
-							injected = null
-						}
-						const ok = hookSettingsSeat()
-						// 没找到设置按钮（例如页面还在加载）就不算完成，等下一轮。
-						return ok
-					}
-					if (lite === false) {
-						// 完整模式：设置那一格**保持原样**（把之前的改动还原），另放一个图标。
-						const seat = document.querySelector('button[data-dsh-lite-seat="1"]')
-						if (seat !== null) {
-							// 有残留的改动 → 全部还原，下一轮重新按完整模式处理。
-							restoreAll()
-							return false
-						}
-						return hookAccountRow()
-					}
-					return false
-				}
-
-				if (sync() === true) {
-					// 已经处理完，挂个 observer 以便 DOM 重建后重做。
-				}
-
-				// DOM 会被 React 重建（展开/收起、进出设置页），所以要跟着重做。
-				// 没有 MutationObserver 的环境（node 测试夹具）就只做一次。
-				let observer = null
-				let frame = 0
-				let tries = 0
-				const retry = () => {
-					if (sync() === true) return
-					if (tries++ > 300) return
-					frame = requestAnimationFrame(retry)
-				}
-				if (typeof MutationObserver === 'function') {
-					observer = new MutationObserver(() => {
-						sync()
-					})
-					observer.observe(document.body, { childList: true, subtree: true })
-				}
-				if (typeof requestAnimationFrame === 'function') frame = requestAnimationFrame(retry)
-
-				return () => {
-					if (observer !== null) observer.disconnect()
-					if (frame !== 0 && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame)
-					restoreAll()
-				}
-			}, [lite, available])
-		}
-
-		/**
-		 * 侧边栏底部那个「精简 / 完整」开关图标。
+		 * ## 它在两种模式下怎么表现
 		 *
-		 * 位置：`sidebar.footer.action` —— DSH 自己声明在侧边栏底部、原「设置」图标
-		 * 旁边的那一格。精简页面把原生设置入口藏掉了（见 lite.js 的 LITE_HIDE），
-		 * 于是这里就是那个位置的唯一控件。
+		 * 只有一条规则：**这个按钮永远在，点它就在两种模式之间切**。
 		 *
-		 * 只在**手机（远程）页面**渲染：
-		 *   - 桌面窗口里直接返回 null（用户要求桌面端一个字节都不动）；
-		 *   - 完整模式页面里也返回 null（那时原生设置入口还在，用户不需要它）。
-		 * @param props - 插槽注入面给的 `ctx`。
+		 *   - 精简模式  → 文案/提示是「切至完整模式」，点完 → 完整模式
+		 *   - 完整模式  → 文案/提示是「切至精简模式」，点完 → 精简模式
+		 *
+		 * 不做「精简模式下才显示」这种条件 —— 那会造成「切到完整模式后没有入口切回
+		 * 来」的死角（我犯过这个错，用户明确报过）。
+		 *
+		 * 侧边栏收起成 56px 竖条时仍然显示（那时 `wide === false`，宿主自己会把
+		 * 文字视觉隐藏，只剩图标，这是宿主的既有行为，不用我处理）。
+		 *
+		 * ## 位置微调
+		 *
+		 * 宿主把这个插槽的容器放在脚区的**上方**且左对齐（实测 `_footerActions`
+		 * 在头像行上面 4px、宽度铺满）。用户要的是「在头像那一行的右侧」，所以
+		 * 渲染完后用 transform 把**按钮自己**平移过去 —— 平移按钮而不是容器，因为
+		 * 容器宽度铺满、平移它只会改垂直位置。
+		 *
+		 * 为什么用 transform 而不是 absolute：容器的定位包含块是整个 frame
+		 * （实测 `offsetParent` 宽 1879px），absolute 会把按钮甩到窗口右边去。
+		 *
+		 * @param props - 插槽注入面给的 `{ ctx }`，加上宿主传的 `{ wide }`。
 		 */
 		function LiteSwitch(props) {
 			const ctx = props.ctx
@@ -857,6 +622,7 @@ window.__ModuleLoader__.load({
 
 			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
 
+			// 读当前状态（只读一次；这个值只用来决定「按钮说切到哪一边」）。
 			const load = useCallback(async () => {
 				const result = await readJson(STATE_PATH)
 				if (result.ok) setState(result.data)
@@ -876,50 +642,57 @@ window.__ModuleLoader__.load({
 					body: JSON.stringify({ enabled: next }),
 				})
 				setBusy(false)
+				// 失败就什么都不做：按钮留在原地，下次点还在。
 				if (!result.ok) return
-				setState((previous) => ({ ...(previous ?? {}), lite: result.data.lite }))
-				// **必须自动刷新**：这个开关只决定「宿主下一次渲染 index 时发哪一版」，
+				// **必须刷新**：这个开关只决定「宿主下一次渲染 index 时发哪一版」，
 				// 已经加载的页面不会自己变。不刷新的话用户点完只看到状态变了、
 				// 界面还是原样 —— 就是「点了没切过来」。
-				// 用 replace() 而不是 reload()：不往历史里塞一条，返回键不会被卡住。
+				// 用 replace() 不是 reload()：不往历史里塞一条，返回键不会被卡住。
 				try {
 					globalThis.location.replace(globalThis.location.href)
 				} catch {
-					/* 极端环境下拿不到 location 就算了，下次刷新自然生效 */
+					/* 拿不到 location 就算了，下次刷新自然生效 */
 				}
 			}, [state])
 
-			// 真正干活的是这个 hook：它把切换动作挂到宿主已有的那两个位置上
-			// （精简模式 → 占用「设置」那一格；完整模式 → 用户名行最右侧加一个图标）。
-			useSwitchHook(state, () => void toggle())
-
-			// 桌面窗口：什么都不渲染（apply 里其实一开始就不会注册）。
+			// 桌面窗口：不渲染（apply 里其实一开始就不会注册）。
 			if (isDesktopWindow()) return null
-			// 这个组件**本身不渲染任何可见内容**：界面全部由 useSwitchHook 挂到宿主
-			// 已有的节点上。这里返回 null 是为了不往 sidebar.footer.action 里多塞东西
-			// （那个容器在上方、默认左对齐，塞进去反而多出一个位置不对的按钮）。
-			void busy
-			void t
-			return null
-		}
+			// 还没有状态就不渲染（避免先闪一个文案不对的按钮）。
+			if (state === null || state.liteAvailable !== true) return null
 
+			// 文案说的是「点下去会发生什么」。
+			const label = state.lite === true ? t.liteEnable : t.liteDisable
+			return h(
+				'button',
+				{
+					type: 'button',
+					style: styles.footerSwitch,
+					disabled: busy,
+					title: label,
+					'aria-label': label,
+					'data-dsh-tailscale-remote-switch': '',
+					onClick: () => void toggle(),
+				},
+				h(LiteSwitchIcon, { size: 16, strokeWidth: 1 }),
+			)
+		}
 		/**
-		 * 注册这个插件的界面。
+		 * 注册这个插件的两处界面。
 		 *
-		 * 两处，规则不同：
+		 * 它们的**命运是分开的**，这是关键：
 		 *
 		 *   1. **设置页那一行（手机连接 + 换密钥）** —— 注册在 `settings.general.item`
-		 *      上，而那个插槽由 `ui-settings-general` 声明。
+		 *      上，那个插槽由 `ui-settings-general` 声明。
+		 *      精简图里没有 `ui-settings-general`（`package.json` 的
+		 *      `dsh.client.inject` 不再声明它），于是这里什么也不注册 —— 那 16.6 KB
+		 *      的组件不用传给手机。完整模式里它照常有。
 		 *
-		 *      **精简页面上它自动不出现**：因为精简图里根本没有
-		 *      `ui-settings-general`（`package.json` 的 `dsh.client.inject` 已经
-		 *      不再声明它），`slots.inject` 的回调永远等不到那个插槽，于是什么也不
-		 *      注册 —— 那 16.6 KB 的组件就不用传给手机了。完整模式（桌面 + 手机切到
-		 *      完整版）里它照常有。
+		 *   2. **精简/完整切换按钮** —— 注册在 `sidebar.footer.action` 上，那个插槽
+		 *      由 `ui-sidebar` 声明，**与 `ui-settings-general` 无关**，所以两种模式下
+		 *      它都在。（早先几版把它寄生在设置按钮上，于是「抽掉设置组件」时它跟着
+		 *      消失 —— 那是个设计错误，不是巧合。）
 		 *
-		 *   2. **侧边栏底部的精简/完整切换** —— 只在**手机的远程页面**上出现。
-		 *      桌面窗口里不注册；完整模式下换成用户名那一行右侧的浮动图标（见
-		 *      useSwitchHook）。
+		 * 桌面窗口里第 1 项照旧注册（那是插件原本就有的功能），第 2 项不注册。
 		 *
 		 * 用 `slots.inject` 而不是 `slots.register` 直调：插槽由别的包声明，它和本包的
 		 * 激活顺序没有保证。
@@ -941,8 +714,7 @@ window.__ModuleLoader__.load({
 				),
 			)
 
-			// 侧边栏底部的精简/完整图标：**只**在手机的远程页面上有。
-			// 桌面窗口里直接不注册 —— 用户要求桌面端一个字节都不动。
+			// 精简/完整切换按钮：只在手机的远程页面上有；桌面窗口不注册。
 			if (isDesktopWindow()) return
 			ctx.slots.inject('sidebar.footer.action', () =>
 				ctx.slots.register(

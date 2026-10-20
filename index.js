@@ -25,7 +25,7 @@
 import { spawn } from 'node:child_process'
 import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -659,15 +659,29 @@ function createLiteController(scope, config, runtime) {
     })
   }
 
-  /** 读一个包的内核字节；读不到就返回 undefined（调用方回 404，让客户端自己回落单包 URL）。 */
+  /**
+   * 读一个包的内核字节；读不到就返回 undefined（调用方回 404，让客户端自己回落单包 URL）。
+   *
+   * **缓存键必须带文件时间戳**，不能只用包名。教训：早先只用包名做键，于是在 DSH
+   * 运行期间改了 `client.js`、装进 profile、刷新页面 —— 宿主仍然吐**第一次读到的那
+   * 份旧字节**，表现为「代码明明改了却完全没效果」，浪费了大量时间。
+   * 带上 mtime 之后，文件一变就重读，而没变时仍然命中缓存（读盘只花一次）。
+   */
   const readBundle = async (id) => {
-    const cached = bundleCache.get(id)
-    if (cached !== undefined) return cached
     const path = clientModules.clientPath(id)
     if (typeof path !== 'string') return undefined
+    let stamp
+    try {
+      const info = await stat(path)
+      stamp = `${info.mtimeMs}:${info.size}`
+    } catch {
+      return undefined
+    }
+    const cached = bundleCache.get(id)
+    if (cached !== undefined && cached.stamp === stamp) return cached.bytes
     try {
       const bytes = await readFile(path)
-      bundleCache.set(id, bytes)
+      bundleCache.set(id, { stamp, bytes })
       return bytes
     } catch {
       return undefined
@@ -677,22 +691,23 @@ function createLiteController(scope, config, runtime) {
   /**
    * 把一个合并请求的正文压好并缓存。
    *
-   * 缓存键是「包名 + 各自的 rev + 协商到的编码」：rev 变了 URL 就变了，所以旧条目
-   * 永远不会被错误命中，也就不需要失效逻辑。缓存值同时记住未压缩大小，方便状态端点
-   * 报出真实节省。
+   * 缓存键是「包名 + 正文哈希 + 协商到的编码」。
    *
-   * 为什么缓存：brotli q5 压这 5 MB 要约 0.1–0.5 s。不缓存的话每次刷新手机都要等
-   * 这段时间；缓存之后只有第一次付出。
+   * **不能只用包名/rev**：`rev` 由 DSH 按包的元数据算，**不随文件内容变化**。
+   * 早先用包名做键，于是在 DSH 运行期间改了 `client.js` 也没效果 —— 宿主一直吐
+   * 第一次压好的旧正文。加正文哈希之后，内容一变键就变，缓存自动失效；内容没变
+   * 时仍然命中（brotli q5 压这几 MB 要约 0.1–0.5 s，不该每次刷新都付）。
    * @param ids - 该段的包名（有序）。
    * @param buffers - 与之对应的原始字节。
    * @param acceptEncoding - 客户端的 `Accept-Encoding`。
    * @returns `{ body, encoding }`。
    */
   const encodeCombo = async (ids, buffers, acceptEncoding) => {
-    const key = `${ids.join(',')}|${String(acceptEncoding ?? '')}`
+    const raw = composeComboBody(buffers)
+    const digest = createHash('sha1').update(raw).digest('hex').slice(0, 16)
+    const key = `${ids.join(',')}|${digest}|${String(acceptEncoding ?? '')}`
     const cached = comboCache.get(key)
     if (cached !== undefined) return cached
-    const raw = composeComboBody(buffers)
     const encoded = encodeComboBody(raw, acceptEncoding)
     const record = { ...encoded, rawBytes: raw.length }
     comboCache.set(key, record)

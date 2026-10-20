@@ -585,19 +585,17 @@ describe('切换控件：挂到宿主已有的两个位置上', () => {
       }
     })
 
-    it('两种模式各自挂到正确的位置（源码层面的契约）', () => {
+    it('切换按钮**不寄生**在宿主的设置按钮上（这是之前反复翻车的根因）', () => {
       const source = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
-      const at = source.indexOf('function useSwitchHook')
-      assert.ok(at > 0, '必须有 useSwitchHook')
-      const seg = source.slice(at, at + 9000)
-      // 精简模式 → 占用「设置」那一格。
-      assert.ok(seg.includes('[data-slot="settings.trigger"]'), '精简模式要换掉设置那个图标')
-      assert.ok(seg.includes('triggerLabel'), '精简模式要换掉「设置」两个字')
-      // 完整模式 → 用户名那一行最右侧。
-      assert.ok(seg.includes('aria-haspopup="menu"'), '完整模式要找用户名那一行')
-      assert.ok(seg.includes('data-dsh-tailscale-remote-floating'), '完整模式要插一个浮动图标')
-      // 必须记得还原（不能把宿主的设置按钮永久改坏）。
-      assert.ok(seg.includes('restore'), '必须能逐字还原')
+      // 早先几版用 DOM 增强去改设置按钮的图标/文字/点击，于是「抽掉
+      // ui-settings-general」时切换按钮跟着消失。那种寄生做法必须彻底消失。
+      assert.equal(source.includes('useSwitchHook'), false, '寄生式 DOM 增强必须删掉')
+      assert.equal(source.includes('[data-slot="settings.trigger"]'), false, '不许再改设置触发按钮')
+      assert.equal(source.includes('data-dsh-lite-seat'), false, '不许再占用设置那一格')
+      assert.equal(source.includes('data-dsh-tailscale-remote-floating'), false, '不许再往用户名行塞浮动图标')
+      // 它必须有自己的座位：`sidebar.footer.action`（由 ui-sidebar 声明，
+      // inject 里不含 ui-settings-general，所以精简图里也一定在）。
+      assert.ok(source.includes("'sidebar.footer.action'"), '切换按钮要注册在 sidebar.footer.action 上')
     })
   })
 
