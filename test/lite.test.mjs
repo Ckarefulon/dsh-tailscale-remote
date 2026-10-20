@@ -298,11 +298,10 @@ test('rewriteIndex：没找到任何 preload 也照样换图（不靠预载行�
 
 // —— 界面裁剪与压缩 ————————————————————————————————————————————————————————
 
-test('精简种子不含用户点名不要的那几项（设置页 / 轨迹 / 工具 / 附件 / 引用 / 快捷键 UI）', () => {
+test('精简种子不含那几项（设置页 / 轨迹 / 附件 / 引用 / 快捷键 UI）', () => {
   const dropped = [
     '@deepseek-ai/dsh-client-ui-settings-general',
     '@deepseek-ai/dsh-client-ui-trajectory',
-    '@deepseek-ai/dsh-client-ui-tool',
     '@deepseek-ai/dsh-client-ui-attachment',
     '@deepseek-ai/dsh-client-ui-reference',
     '@deepseek-ai/dsh-client-ui-shortcuts',
@@ -311,6 +310,15 @@ test('精简种子不含用户点名不要的那几项（设置页 / 轨迹 / �
   // 但 ui-settings（服务）必须留：它 provide configForms，locale/theme/chat 硬依赖它。
   assert.ok(LITE_SEEDS.includes('@deepseek-ai/dsh-client-ui-settings'), 'ui-settings 是服务，必须留')
   assert.ok(!LITE_REQUIRED.includes('@deepseek-ai/dsh-client-ui-settings-general'), '设置页界面不再是必需')
+})
+
+test('ui-tool **必须**留（删了工具调用会退化成「未知 Surface 事件」+ 原始 JSON）', () => {
+  // 它往 `conversation.chat.node` 注册 `key: "tool-call"`；ui-chat 里那条
+  // `renderSlot("conversation.chat.node", ..., { entryKey: routedNode.kind,
+  // fallback: JsonBlock(t("message.unknownSurface")) })` 找不到注册就会落到兜底。
+  assert.ok(LITE_SEEDS.includes('@deepseek-ai/dsh-client-ui-tool'), 'ui-tool 必须在种子里')
+  // 它不 provide 任何服务，所以加回来不会连带别的包（只多它自己一个）。
+  assert.ok(!LITE_SEEDS.includes('@deepseek-ai/dsh-client-ui-trajectory'), '轨迹仍然不要')
 })
 
 test('sidebar-right 仍会被图边带回来（不能从图里删，只能藏界面）', () => {
@@ -380,14 +388,11 @@ test('encodeComboBody：解回来必须与原文逐字一致（否则手机拿�
 })
 
 
-test('rewriteIndex 也修掉「搜索会话」前面那段硬编码空白（只在这份页面上）', () => {
+test('搜索那一格整个藏掉（用户不要搜索；只藏按钮会留一片空白）', () => {
   const lite = composeLiteGraph(sampleGraph())
   const result = rewriteIndex(sampleIndex(), { lite })
   assert.equal(result.changed, true)
-  // 成因是 searchSlot 自带的 margin-left:146px（实测 DOM），归零即可。
-  assert.match(result.html, /\[class\*="_searchSlot"\]\{margin-left:0 !important/)
-  // 必须仍然留着 flex:0 0 auto，否则按钮会被 flex 挤走。
-  assert.match(result.html, /flex:0 0 auto !important/)
+  assert.ok(result.html.includes('[class*="_searchSlot"]'), 'searchSlot 必须整格藏掉')
 })
 
 test('布局修正与隐藏规则在同一段 <style> 里，且总共只注入一段', () => {

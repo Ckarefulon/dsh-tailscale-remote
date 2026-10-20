@@ -111,6 +111,11 @@ export const LITE_SEEDS = [
   '@deepseek-ai/dsh-client-ui-approval',
   '@deepseek-ai/dsh-client-ui-user-questions',
   '@deepseek-ai/dsh-client-ui-message-feedback',
+  // 工具调用的渲染器。它往 `conversation.chat.node` 注册 `key: "tool-call"`；
+  // 少了它，每一步工具调用都会落到 ui-chat 的兜底分支，显示成
+  // 「未知 Surface 事件」+ 一大坨原始 JSON —— 手机上基本看不了。
+  // 代价 54 KB gzip（198 KB 原始），且它不 provide 任何服务，不会带回别的包。
+  '@deepseek-ai/dsh-client-ui-tool',
   '@deepseek-ai/dsh-client-ui-renderer',
   '@deepseek-ai/dsh-client-ui-settings',
   'dsh-tailscale-remote',
@@ -156,29 +161,25 @@ export const LITE_HIDE = [
   'button[aria-label="收起右侧边栏"]',
   // 会话视图切换里那个「轨迹」页签。
   '[data-slot="conversation.view"][data-slot-id="trajectory"]',
+  // 「搜索会话」按钮（用户明确不要）。它连同自己那一格一起藏 —— 那一格
+  // `_9lTDKa_searchSlot` 占了整行的剩余宽度，只藏按钮会留下一片空白。
+  '[class*="_searchSlot"]',
+  // 输入框右边那个**上下文占用**指示器（`33%` 那个圆环，用户说不要）。
+  // 它的 `aria-label` 是「上下文已用 N%」，是这个元素唯一稳定的语义锚点。
+  '[aria-label^="上下文已用"]',
+  '[aria-label^="Context used"]',
 ]
 
 /**
  * 精简页面上要**修的布局**（只改这一份页面）。
  *
- * 只做一件事：把「工作区」标题行里搜索按钮前面那段空档去掉。
+ * 目前为空：搜索那一格已经整个藏掉了（见 LITE_HIDE），原来那条「把它的
+ * 硬编码 `margin-left:146px` 归零」的修正也就没意义了。
  *
- * 成因（实测 DOM）：那一行是 `display:flex; gap:4px; justify-content:flex-end`，
- * 但搜索按钮的容器 `_9lTDKa_searchSlot` 自带 `flex: 1 1 0%` 和一个**硬编码**的
- * `margin-left: 146px`。146px 是按「工作区」这几个字的宽度估出来的，一旦窄了/宽了
- * 就留下一段多余空白。把它归零、让 flex 自己撑开，按钮就贴到右边该在的位置。
- *
- * 为什么用属性选择器而不是哈希类名：`_9lTDKa_` 前缀是构建产物，DSH 一升级就变；
- * `[class*="_searchSlot"]` 认的是那一段可读的语义名，稳得多，而且匹配不到时只是
- * 布局保持原样，不会坏事。
+ * 保留这个空数组是因为注入管线要遍历它 —— 以后再有布局修正，加一条
+ * `{ selector, css }` 即可，不用改调用方。
  */
-export const LITE_FIX = [
-  {
-    // 搜索按钮那一格：去掉硬编码左边距，让它靠 flex 定位。
-    selector: '[class*="_searchSlot"]',
-    css: 'margin-left:0 !important;flex:0 0 auto !important',
-  },
-]
+export const LITE_FIX = []
 
 /** 去掉 DSH loader 里那个 `/client` 子路径后缀，得到包名。 */
 export function stripClientSuffix(id) {
@@ -415,6 +416,21 @@ export const LITE_MARKER = '__DSH_TAILSCALE_REMOTE_LITE__'
 const PRELOAD_PATTERN = /<link rel="preload" as="script" href="plugins\/\?\?[^"]*">/g
 
 /**
+ * 整图上那个 **bootstrap** 脚本（`<script src="plugins/??...">`）。
+ *
+ * 它是页面加载的第一段代码（`@deepseek-ai/dsh-client-modules`，约 46 KB），DSH 把它
+ * 写成 `<script src>` 而不是 preload。它走的是 DSH 自己的 `/plugins/??` 路由，那
+ * 条路由**自己不压缩**、只靠 webserver 的 gzip level 1 —— 实测 46,345 B，而同一份
+ * 字节用 brotli 只要约 13 KB。
+ *
+ * 所以在精简页面上把它也换成**我们自己的路由**（那条路由会按 `Accept-Encoding`
+ * 协商 brotli / gzip），这样首屏第一段就能省下约 33 KB。
+ *
+ * 只匹配 `src="plugins/??..."`：`<link rel="preload">` 那些上面已经单独处理过了。
+ */
+const BOOTSTRAP_PATTERN = /<script src="plugins\/\?\?[^"]*"><\/script>/g
+
+/**
  * 把宿主渲染好的 index.html 改写成精简版。
  *
  * 只动三处，别的一律原样保留（其它插件的注入、`<base href="./">`、`__DSH_BOOT_READY__`
@@ -452,6 +468,18 @@ export function rewriteIndex(html, input) {
   const headEnd = head.index + head[0].length
   out = `${out.slice(0, headEnd)}${preloads}${out.slice(headEnd)}`
 
+  // 把 bootstrap 那个 `<script src="plugins/??...">` 换成精简图里的那一段，
+  // 于是它走我们的路由（能协商 brotli），而不是 DSH 那条只 gzip 的路由。
+  const bootstrap = lite.batches.find((batch) => batch.phase === 'bootstrap')
+  let bootstrapSwapped = 0
+  if (bootstrap !== undefined) {
+    BOOTSTRAP_PATTERN.lastIndex = 0
+    out = out.replace(BOOTSTRAP_PATTERN, () => {
+      bootstrapSwapped += 1
+      return `<script src="${escapeHtmlAttribute(bootstrap.url)}"></script>`
+    })
+  }
+
   const at2 = out.indexOf(BOOT_MARKER)
   const end2 = at2 < 0 ? -1 : out.indexOf('</script>', at2)
   if (at2 < 0 || end2 < 0) return { html, changed: false, reason: 'boot-marker-lost' }
@@ -464,7 +492,14 @@ export function rewriteIndex(html, input) {
   const head2End = head2.index + head2[0].length
   out = `${out.slice(0, head2End)}${marker}${hideCss(input.hide)}${out.slice(head2End)}`
 
-  return { html: out, changed: true, reason: 'ok', removed: matched.length, preloads: lite.batches.length }
+  return {
+    html: out,
+    changed: true,
+    reason: 'ok',
+    removed: matched.length,
+    preloads: lite.batches.length,
+    bootstrapSwapped,
+  }
 }
 
 /**
