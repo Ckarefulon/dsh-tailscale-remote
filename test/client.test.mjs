@@ -277,7 +277,11 @@ describe('浏览器半边', () => {
     const { exports } = loadBundle()
     // locale 写进 inject 会在它缺席时把整包 park 掉，所以只能硬依赖 slots。
     assert.deepEqual(exports.inject, ['slots'])
-    assert.deepEqual(manifest.dsh.client.inject, ['@deepseek-ai/dsh-client-ui-settings-general'])
+    // **不再**声明 `dsh.client.inject`：声明了 ui-settings-general 就会在图上多一条
+    // inject 边，于是那条 16.6 KB 的设置页组件被拉进**精简图**、白白传给手机。
+    // 去掉之后：完整模式里插槽在、照常注册那一行；精简模式里插槽不在、自然什么都不做。
+    assert.equal(manifest.dsh.client.inject, undefined, '不能再声明 dsh.client.inject')
+    assert.equal(manifest.dsh.client.platform, 'web')
   })
 
   it('是合法 JavaScript 且是合法 UTF-8', () => {

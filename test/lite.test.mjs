@@ -420,3 +420,18 @@ test('精简页面上不出现设置按钮（用户要求：那个位置放切�
   // 但原生设置图标的 aria-label 是「设置」，切换后会变成「切至完整模式」，
   // 由 client 半边负责替换（见 useSwitchHook）。
 })
+test('用量统计有**两组**，必须分别藏（只藏一组会漏）', () => {
+  // 实测（真浏览器，打开会话后输入框右边）：
+  //   1. 上下文圆环 `33%`：稳定锚点是 aria-label「上下文已用 N%」
+  //   2. 用量徽章：`9 轮 1086 步 · 118 tok/s` 与 `277M tok · 缓存命中 98%`，
+  //      类名 iq1doa_pill / iq1doa_anchor，没有 aria-label
+  // 用户报过「没删掉」——就是只藏了第 1 组、漏了第 2 组。
+  assert.ok(
+    LITE_HIDE.some((s) => s.includes('上下文已用')),
+    '要藏上下文圆环（按 aria-label）',
+  )
+  assert.ok(
+    LITE_HIDE.some((s) => s.includes('iq1doa_')),
+    '要藏用量徽章（按类名片段）',
+  )
+})

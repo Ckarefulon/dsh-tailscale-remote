@@ -878,6 +878,15 @@ window.__ModuleLoader__.load({
 				setBusy(false)
 				if (!result.ok) return
 				setState((previous) => ({ ...(previous ?? {}), lite: result.data.lite }))
+				// **必须自动刷新**：这个开关只决定「宿主下一次渲染 index 时发哪一版」，
+				// 已经加载的页面不会自己变。不刷新的话用户点完只看到状态变了、
+				// 界面还是原样 —— 就是「点了没切过来」。
+				// 用 replace() 而不是 reload()：不往历史里塞一条，返回键不会被卡住。
+				try {
+					globalThis.location.replace(globalThis.location.href)
+				} catch {
+					/* 极端环境下拿不到 location 就算了，下次刷新自然生效 */
+				}
 			}, [state])
 
 			// 真正干活的是这个 hook：它把切换动作挂到宿主已有的那两个位置上
@@ -899,19 +908,25 @@ window.__ModuleLoader__.load({
 		 *
 		 * 两处，规则不同：
 		 *
-		 *   1. **设置页那一行（手机连接 + 换密钥）** —— 条件注册，桌面与手机**都有**。
-		 *      这是插件原本就有的功能，不是这次新加的东西，任何时候都不该消失。
+		 *   1. **设置页那一行（手机连接 + 换密钥）** —— 注册在 `settings.general.item`
+		 *      上，而那个插槽由 `ui-settings-general` 声明。
 		 *
-		 *   2. **侧边栏底部的精简/完整图标** —— 只在**手机的远程页面**上出现。
-		 *      桌面窗口里不注册、完整模式页面里也不渲染（见 LiteSwitch）。
+		 *      **精简页面上它自动不出现**：因为精简图里根本没有
+		 *      `ui-settings-general`（`package.json` 的 `dsh.client.inject` 已经
+		 *      不再声明它），`slots.inject` 的回调永远等不到那个插槽，于是什么也不
+		 *      注册 —— 那 16.6 KB 的组件就不用传给手机了。完整模式（桌面 + 手机切到
+		 *      完整版）里它照常有。
+		 *
+		 *   2. **侧边栏底部的精简/完整切换** —— 只在**手机的远程页面**上出现。
+		 *      桌面窗口里不注册；完整模式下换成用户名那一行右侧的浮动图标（见
+		 *      useSwitchHook）。
 		 *
 		 * 用 `slots.inject` 而不是 `slots.register` 直调：插槽由别的包声明，它和本包的
 		 * 激活顺序没有保证。
 		 * @param ctx - 客户端根上下文。
 		 */
 		function apply(ctx) {
-			// 设置页那一行：桌面和手机都注册（原本就有的功能，不能因为「精简模式只在
-			// 远程端」而被连带删掉）。
+			// 设置页那一行：插槽在就注册，不在（精简图里）就自然什么也不做。
 			ctx.slots.inject('settings.general.item', () =>
 				ctx.slots.register(
 					{
