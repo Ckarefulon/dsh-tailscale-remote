@@ -435,3 +435,10 @@ test('用量统计有**两组**，必须分别藏（只藏一组会漏）', () =
     '要藏用量徽章（按类名片段）',
   )
 })
+test('Agent 预设选择器在种子里（新建会话首页上选「标准 / PTC / 极简 / 创造模式」）', () => {
+  // 它往 `conversation.hero.agentPreset` 注册，那个插槽由 ui-conversation 声明。
+  // 代价 36.2 KB gzip、+1 个 entry（实测不连带别的包）。
+  assert.ok(LITE_SEEDS.includes('@deepseek-ai/dsh-client-ui-agent-preset'), '预设选择器要在种子里')
+  // 依赖它的那个插槽的声明方也必须在，否则注册进去也没人渲染。
+  assert.ok(LITE_SEEDS.includes('@deepseek-ai/dsh-client-ui-conversation'), 'ui-conversation 必须留')
+})

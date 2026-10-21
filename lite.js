@@ -116,6 +116,12 @@ export const LITE_SEEDS = [
   // 「未知 Surface 事件」+ 一大坨原始 JSON —— 手机上基本看不了。
   // 代价 54 KB gzip（198 KB 原始），且它不 provide 任何服务，不会带回别的包。
   '@deepseek-ai/dsh-client-ui-tool',
+  // Agent 预设选择器（新建会话那个首页上的「标准 / PTC / 极简 / 创造模式」）。
+  // 它往 `conversation.hero.agentPreset` 注册（那个插槽由 ui-conversation 声明，
+  // 已在精简集里），所以加上它就能在手机上选预设。
+  // 代价 36.2 KB gzip，不 provide 任何服务、不连带别的包（实测 +1 个 entry）。
+  // 依赖也齐：它 inject 的 `remote.agentPresets` 由 api-remotes 挂载（已在集合里）。
+  '@deepseek-ai/dsh-client-ui-agent-preset',
   '@deepseek-ai/dsh-client-ui-renderer',
   '@deepseek-ai/dsh-client-ui-settings',
   'dsh-tailscale-remote',
