@@ -557,6 +557,82 @@ describe('切换控件：挂到宿主已有的两个位置上', () => {
         assert.equal(typeof registration.component, 'function', `lite=${lite} 时组件必须存在`)
       }
     })
+
+    /** 状态端点：精简可用（按钮才会渲染）。 */
+    const availableFetch = () => async (path) => {
+      if (path === '/api/dsh-tailscale-remote/state') {
+        return { status: 200, json: async () => ({ ok: true, phase: 'ready', liteAvailable: true }) }
+      }
+      return { status: 200, json: async () => ({ ok: true }) }
+    }
+
+    /**
+     * 把切换按钮渲染到「状态已落地」的那一帧，并把按钮本身取出来。
+     *
+     * `window.__DSH_TAILSCALE_REMOTE_LITE__` 就是宿主改写 index 时种下的「这份页面是哪一版」
+     * 标记 —— 测试通过它模拟「现在看到的是精简页 / 完整页」。
+     */
+    async function renderSwitch({ pageIsLite, ...overrides } = {}) {
+      const window = pageIsLite ? { __DSH_TAILSCALE_REMOTE_LITE__: 'lite' } : {}
+      const env = applyAndCollect({ ...overrides, window })
+      const inject = env.registrations.filter((r) => r.kind === 'slots.inject').find((r) => r.name === 'sidebar.footer.action')
+      inject.register()
+      const registration = env.registrations.find(
+        (r) => r.kind === 'slots.register' && r.definition.name === 'sidebar.footer.action',
+      )
+      const props = registration.definition.inject()
+      env.renderer.render(registration.component, props)
+      await env.renderer.flush()
+      const tree = env.renderer.render(registration.component, props)
+      await env.renderer.flush()
+      return { ...env, tree, registration, props }
+    }
+
+    it('精简页上按钮说「切至完整模式」，点下去让宿主开一次完整页授权（enabled=false）', async () => {
+      const { tree, renderer, calls } = await renderSwitch({ pageIsLite: true, fetch: availableFetch() })
+      assert.equal(tree.type, 'button', '精简页上必须渲染出按钮')
+      assert.equal(tree.props['aria-label'], '切至完整模式')
+
+      tree.props.onClick()
+      await renderer.flush()
+      const post = calls.find((call) => call.path === '/api/dsh-tailscale-remote/lite')
+      assert.ok(post !== undefined, '必须打到精简开关端点（客户端记不住这件事，只有宿主知道下一版页面发什么）')
+      assert.equal(post.options.method, 'POST')
+      assert.equal(JSON.parse(post.options.body).enabled, false, '切至完整 = enabled=false（开完整页授权）')
+    })
+
+    it('完整页上按钮说「切至精简模式」，点下去立刻撤销授权（enabled=true）', async () => {
+      const { tree, renderer, calls } = await renderSwitch({ pageIsLite: false, fetch: availableFetch() })
+      assert.equal(tree.props['aria-label'], '切至精简模式')
+
+      tree.props.onClick()
+      await renderer.flush()
+      const post = calls.find((call) => call.path === '/api/dsh-tailscale-remote/lite')
+      assert.equal(JSON.parse(post.options.body).enabled, true, '切回精简 = enabled=true（撤销窗口）')
+    })
+
+    it('文案按「正在看的这份页面」说话，而不是按状态端点里的 lite（两者在切换瞬间是反的）', async () => {
+      // 状态端点说「下一次渲染会裁」（lite=true），但这份页面其实是完整页。
+      // 按状态端点说话就会写成「切至完整模式」—— 点了等于原地转圈。
+      const { tree } = await renderSwitch({
+        pageIsLite: false,
+        fetch: async (path) => {
+          if (path === '/api/dsh-tailscale-remote/state') {
+            return { status: 200, json: async () => ({ ok: true, lite: true, liteAvailable: true }) }
+          }
+          return { status: 200, json: async () => ({ ok: true }) }
+        },
+      })
+      assert.equal(tree.props['aria-label'], '切至精简模式')
+    })
+
+    it('这台 DSH 没有精简模式（liteAvailable=false）时不渲染按钮', async () => {
+      const { tree } = await renderSwitch({
+        pageIsLite: false,
+        fetch: async () => ({ status: 200, json: async () => ({ ok: true, liteAvailable: false }) }),
+      })
+      assert.equal(tree, null)
+    })
   })
 
   describe('图标本身符合 DSH 规范', () => {

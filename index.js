@@ -119,7 +119,9 @@ function normalizeConfig(raw) {
     // 精简模式（默认开）：HTTP 渲染出来的 index.html 只带手机真正需要的那部分客户端插件，
     // 首屏从约 5.3 MB gzip 降到约 1.3 MB。**桌面版不受影响**（它不经过这条路，见 lite.js 顶部）。
     //
-    // 这里只是**默认值**：用户在设置页里切换过一次之后，以那个持久选择为准。
+    // 这是**硬开关**：false = 这台实例永远不裁页面，那个切换按钮也不出现。
+    // 开着的时候，远程端**每次连上来都是精简页**，只有用户按了「切至完整模式」之后的
+    // 一小段窗口里才发完整页（见 FULL_PAGE_GRANT_MS）—— 没有「记住上次选择」这回事。
     lite: source.lite !== false,
     // 精简模式的种子包（不填就用 lite.js 里那份默认白名单）。
     // 只在「DSH 升级后默认白名单失配、又想自己补几个包」时才需要。
@@ -468,6 +470,27 @@ function sessionCookieHeader(minted) {
 const STATE_PATH = '/api/dsh-tailscale-remote/state'
 const ROTATE_PATH = '/api/dsh-tailscale-remote/rotate'
 const LITE_PATH = '/api/dsh-tailscale-remote/lite'
+
+/**
+ * 「切至完整模式」的授权窗口（毫秒）。
+ *
+ * ## 为什么是「窗口」而不是一个持久的选择
+ *
+ * 用户的规则是一句话：**远程端每次连上来都是精简模式，只有按了那个按钮才会是完整模式，
+ * 而且这个选择不保留。** 于是不能有「上次选了完整」这种东西 —— 它既不能写盘（跨重启
+ * 保留），也不该跨设备/跨页面保留。
+ *
+ * 但「按按钮 → 完整」这条链路本身要跨过一次页面加载：按钮只能改宿主状态，然后刷新；
+ * 真正决定发哪一版页面的是**刷新之后**那次 index 渲染。所以宿主需要一个「刚刚有人按过
+ * 切至完整模式」的短期授权，让紧随其后的那次渲染发完整页。窗口而不是「消费一次」，是
+ * 因为手机浏览器可能对 `/` 发两次请求（预取、重试、企业代理），一次性授权被前一次吃掉
+ * 就会表现成「按钮点了没反应」。窗口过后自动回到精简，**没有任何东西被记住**。
+ *
+ * 20 秒足够覆盖一次慢速移动网络的刷新，又短到「关掉页面过一会儿再连」必然回到精简。
+ * 反过来按「切至精简模式」时会**立刻清掉**这个窗口，所以刚切到完整又马上想切回来时不会
+ * 被还在窗口里的授权挡住。
+ */
+const FULL_PAGE_GRANT_MS = 20_000
 
 /**
  * 惰性版：启动期**什么都不做**，只在手机的 WebSocket 真的开始握手时才付出代价。
@@ -887,21 +910,42 @@ function createLiteController(scope, config, runtime) {
   }
 
   /**
-   * 精简开关。
+   * 当前是否处在「刚按过切至完整模式」的授权窗口里。
    *
-   * 两层，顺序不能反：
-   *  1. `config.lite` 是**硬开关** —— 关掉就意味着这台实例不做这件事，用户的选择也翻不过来。
-   *     否则「配置里关了」会被「用户点过开启」压过去，那个配置项就成了谎话。
-   *  2. 在配置允许的前提下，用户的**持久选择**（`runtime.liteChoice`）优先于配置的默认值
-   *     —— 否则用户点了关闭、刷新页面又变回精简，看起来像按钮坏了。
+   * 只活在内存里：进程一重启就归零，从不写盘 —— 这正是「不保留上次选择」的落点。
+   * @returns 窗口是否仍然有效。
+   */
+  function fullGranted() {
+    const until = runtime.fullUntil
+    return typeof until === 'number' && Date.now() < until
+  }
+
+  /** 记下一段完整页授权窗口（用户按了「切至完整模式」）。 */
+  function grantFull() {
+    runtime.fullUntil = Date.now() + FULL_PAGE_GRANT_MS
+  }
+
+  /** 立刻撤销完整页授权（用户按了「切至精简模式」）。 */
+  function revokeFull() {
+    runtime.fullUntil = 0
+  }
+
+  /**
+   * 这一版页面要不要裁。
+   *
+   * 两条，顺序不能反：
+   *  1. `config.lite` 是**硬开关** —— 关掉就意味着这台实例不做这件事，按钮也翻不过来
+   *     （否则那个配置项就是谎话）。
+   *  2. 在配置允许的前提下，**默认永远是精简**；只有「刚按过切至完整模式」的短窗口里
+   *     才发完整页。没有「上次的选择」这种状态 —— 见 `FULL_PAGE_GRANT_MS`。
    * @returns 是否把页面裁小。
    */
   function liteEnabled() {
     if (!config.lite) return false
-    return runtime.liteChoice ?? true
+    return !fullGranted()
   }
 
-  return { liteEnabled, currentLite, serveLiteBundle }
+  return { liteEnabled, fullGranted, grantFull, revokeFull, currentLite, serveLiteBundle }
 }
 
 /**
@@ -997,11 +1041,12 @@ function statePayload(config, runtime) {
     httpsPort: state?.httpsPort ?? config.httpsPort,
     cookieMaxAgeDays: state?.cookieMaxAgeDays ?? config.cookieMaxAgeDays,
     updatedAt: state?.updatedAt ?? null,
-    // 精简模式状态。`lite` 说的是**这份页面真的被裁了没有**（控制器已算出精简图并改写成功），
-    // `liteChoice` 说的是**用户选了什么**；两者在切换后、重载前会不一致，所以分开报。
+    // 精简模式状态。`lite` 说的是**这一版页面会不会被裁**（默认 true，只有在
+    // 「刚按过切至完整模式」的短窗口里才会是 false），`liteFullGranted` 说明那个窗口
+    // 是否仍然有效。这里没有「用户上次选了什么」—— 那种状态已经彻底去掉了。
     lite: runtime.liteController === undefined ? null : runtime.liteController.liteEnabled(),
-    liteAvailable: runtime.liteController !== undefined,
-    liteChoice: runtime.liteChoice ?? null,
+    liteAvailable: config.lite && runtime.liteController !== undefined,
+    liteFullGranted: runtime.liteController === undefined ? null : runtime.liteController.fullGranted(),
     liteDefault: config.lite,
     liteCount: runtime.lite?.ids?.length ?? null,
     litePreloadRemoved: runtime.lite?.removed ?? null,
@@ -1206,9 +1251,17 @@ function registerAdminRoutes(scope, config, runtime, deps = REAL_DEPS) {
 
   // 切换精简模式。
   //
-  // 为什么要走服务端而不是客户端存 localStorage：这个开关决定的是**宿主下一次渲染
-  // index 时发哪一版页面** —— 它必须让宿主知道，不能只存在浏览器里。写进状态文件
-  // 才能跨重启保留，也让手机和电脑看到同一个选择（用户可能从任意一端切）。
+  // 语义刻意做成「一次性授权」，**不写盘、不记住**：
+  //   - `{ enabled: false }`（切至完整模式）→ 开一个 `FULL_PAGE_GRANT_MS` 的窗口，
+  //     紧接其后的那次 index 渲染发完整页；窗口过后自动回到精简。
+  //   - `{ enabled: true }`（切至精简模式）→ 立刻清掉窗口，刷新即回精简。
+  //
+  // 为什么不是「存用户的选择」：用户明确要求远程端**每次连上来都是精简模式**，
+  // 只有按按钮触发的那一次才是完整模式。持久的选择会让他某天在手机上点了一下完整，
+  // 之后每次连都掉进 5 MB 的页面里，而且没有任何提示。
+  //
+  // 为什么必须走服务端而不是客户端记一个标记：这个开关决定的是**宿主下一次渲染
+  // index 时发哪一版页面**，只有宿主知道。
   scope.effect(
     () =>
       routes.register({
@@ -1226,15 +1279,12 @@ function registerAdminRoutes(scope, config, runtime, deps = REAL_DEPS) {
             if (controller === undefined) {
               return json({ ok: false, error: '这条 DSH 上没有 Web 渲染路径，精简模式不可用' }, 409)
             }
-            runtime.liteChoice = enabled
-            // 立刻写盘：用户切完通常马上刷新页面，重启后也得记住。
-            // 失败**不算失败**：这次切换在本次运行里已经生效，只是下次重启会回默认值。
-            //
-            // `deps` 必须一路透传到这里：这个函数写的是**真实的** `~/.dsh/tailscale-remote.json`，
-            // 而单测会调这条路由。测试若不替换 deps，就会把用户的持久登录密钥覆盖掉
-            // —— 下一次重启长出**新**密钥，手机上的书签当场失效。（这个坑真的踩过一次。）
-            const warning = await persistLiteChoice(scope, config, runtime, enabled, deps)
-            return json({ ok: true, lite: controller.liteEnabled(), ...(warning === undefined ? {} : { warning }) })
+            if (!config.lite) {
+              return json({ ok: false, error: '配置里 lite=false，这台实例不发精简页面' }, 409)
+            }
+            if (enabled) controller.revokeFull()
+            else controller.grantFull()
+            return json({ ok: true, lite: controller.liteEnabled(), fullGranted: controller.fullGranted() })
           } catch (error) {
             return json({ ok: false, error: String(error?.message ?? error) }, 409)
           }
@@ -1242,27 +1292,6 @@ function registerAdminRoutes(scope, config, runtime, deps = REAL_DEPS) {
       }),
     'tailscale-remote: lite route',
   )
-}
-
-/**
- * 把精简开关的选择写进状态文件。
- *
- * 只在**已有状态文件**上改：没有的话（远程访问还没起来）就别凭空造一个，
- * 那会写出一份缺 `authority` 的半截记录。
- * @param deps - 依赖注入；测试必须替换掉它，否则会写真实的 `~/.dsh/tailscale-remote.json`。
- * @returns 写失败时的提示文案；成功或无需写时返回 undefined（绝不抛）。
- */
-async function persistLiteChoice(scope, config, runtime, enabled, deps = REAL_DEPS) {
-  const state = runtime.state
-  if (state === undefined) return undefined
-  const next = { ...state, lite: enabled, updatedAt: new Date().toISOString() }
-  try {
-    await deps.persistState(scope, next)
-    runtime.state = next
-    return undefined
-  } catch (error) {
-    return `选择已生效，但没能写进状态文件（下次重启可能回默认值）：${String(error?.message ?? error)}`
-  }
 }
 
 /**
@@ -1286,10 +1315,12 @@ function freshRuntime(undo) {
     /** 回落跳转用的带令牌地址。 */
     handoffUrl: undefined,
     /**
-     * 用户对精简模式的**持久选择**（写进状态文件，跨重启保留）。
-     * undefined = 从没选过，这时用配置里的默认值。
+     * 「切至完整模式」授权窗口的截止时间（毫秒时间戳）。0 / 缺席 = 没有授权。
+     *
+     * **只在内存里**：进程重启即归零，从不写盘。用户要求远程端每次连上来都是精简
+     * 模式，所以这里刻意没有任何「上次的选择」。见 `FULL_PAGE_GRANT_MS`。
      */
-    liteChoice: undefined,
+    fullUntil: 0,
     /** 最近一次改写 index 的结果 `{ ids, removed, preloads }`；只用于状态端点观察。 */
     lite: undefined,
     /** `createLiteController` 的产物；桌面端没有 webServer/clientModules 时为 undefined。 */
@@ -1392,16 +1423,9 @@ async function setup(scope, config, undo, deps = REAL_DEPS, runtime = freshRunti
   runtime.undo = undo
   runtime.phase = 'starting'
   runtime.error = undefined
-
-  // 读回用户上次对精简模式的选择。读不到（首次运行 / 文件坏了）就保持 undefined，
-  // 由 `liteEnabled()` 回落配置默认值 —— 一条读失败的记录不该把默认行为改掉。
-  if (config.lite) {
-    const previous = await deps.loadState(scope, config)
-    if (typeof previous?.lite === 'boolean') {
-      runtime.liteChoice = previous.lite
-      logger.info(`tailscale-remote: 读回精简模式选择 = ${String(previous.lite)}`)
-    }
-  }
+  // 精简模式没有「读回上次的选择」这一步：远程端默认永远是精简页，
+  // 只有用户按了那个按钮之后的 20 秒窗口里才发完整页（见 FULL_PAGE_GRANT_MS）。
+  // 状态文件里遗留的 `lite` 字段因此不再被读、也不再被写。
 
   const binary = await deps.resolveBinary(scope, config.binaryPath)
   if (binary === undefined) {
@@ -1552,8 +1576,7 @@ async function setup(scope, config, undo, deps = REAL_DEPS, runtime = freshRunti
     httpsPort: config.httpsPort,
     target,
     cookieMaxAgeDays: config.cookieMaxAgeDays,
-    // 精简模式的选择。写进来才能在重启后被 `setup` 读回去（见开头那段）。
-    lite: runtime.liteChoice ?? config.lite,
+    // 注意这里**没有** `lite` 字段：精简模式不再是「用户的选择」，不再需要跨重启记住。
     updatedAt: new Date().toISOString(),
     stateFile: config.stateFile,
   }
@@ -1668,7 +1691,6 @@ export const internals = {
   createLiteController,
   installWebSocketCompression,
   armWebSocketCompression,
-  persistLiteChoice,
   freshRuntime,
   setup,
   teardown,
@@ -1676,5 +1698,6 @@ export const internals = {
   STATE_PATH,
   ROTATE_PATH,
   LITE_PATH,
+  FULL_PAGE_GRANT_MS,
   AUTH_RECORD_KEY,
 }

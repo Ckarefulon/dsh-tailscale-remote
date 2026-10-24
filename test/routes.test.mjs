@@ -21,6 +21,7 @@ const {
   STATE_PATH,
   ROTATE_PATH,
   LITE_PATH,
+  FULL_PAGE_GRANT_MS,
 } = internals
 
 // 与生产默认值一致：换密钥同时吊销会话。测试若不打开它，就会把新增的那条路径
@@ -632,7 +633,7 @@ test('控制器：开关关掉时 tapIndex 原样返回（一个字节都不改�
   const scope = liteScope({ graph: SAMPLE_GRAPH })
   const runtime = freshRuntime({})
   const controller = createLiteController(scope, LITE_CONFIG, runtime)
-  runtime.liteChoice = false
+  controller.grantFull()
 
   const html = SAMPLE_INDEX
   assert.equal(scope.store.webServer.taps[0](html), html)
@@ -670,22 +671,41 @@ test('控制器：config.lite=false 时永不精简（配置默认关掉了）',
   assert.equal(scope.store.webServer.taps[0](SAMPLE_INDEX), SAMPLE_INDEX)
 })
 
-test('控制器：用户的选择压过配置默认值，但压不过 config.lite=false（硬开关）', () => {
-  // 配置允许时，用户点过「关闭」就该一直关着，哪怕配置默认是开。
+test('控制器：完整页只来自一次性授权窗口 —— 默认永远精简，窗口过后自动回到精简', () => {
   const scope = liteScope({ graph: SAMPLE_GRAPH })
   const runtime = freshRuntime({})
   const controller = createLiteController(scope, LITE_CONFIG, runtime)
-  assert.equal(controller.liteEnabled(), true, '没选过就随配置默认（开）')
-  runtime.liteChoice = false
-  assert.equal(controller.liteEnabled(), false, '用户选择必须压过配置默认值')
+
+  // 默认就是精简（没有任何「上次的选择」这种东西）。
+  assert.equal(controller.liteEnabled(), true, '没有授权窗口时必须发精简页')
+  assert.notEqual(scope.store.webServer.taps[0](SAMPLE_INDEX), SAMPLE_INDEX)
+
+  // 按了「切至完整模式」：窗口内发完整页，一个字节都不改。
+  controller.grantFull()
+  assert.equal(controller.fullGranted(), true)
+  assert.equal(controller.liteEnabled(), false)
   assert.equal(scope.store.webServer.taps[0](SAMPLE_INDEX), SAMPLE_INDEX)
 
-  // 配置硬关时，用户怎么选都不精简 —— 否则那个配置项就是谎话。
-  const hard = liteScope({ graph: SAMPLE_GRAPH })
-  const hardRuntime = freshRuntime({})
-  const hardController = createLiteController(hard, { ...CONFIG, lite: false }, hardRuntime)
-  hardRuntime.liteChoice = true
-  assert.equal(hardController.liteEnabled(), false, 'config.lite=false 是硬开关，谁也翻不过来')
+  // 按了「切至精简模式」：立刻撤销，不等窗口自然过期（否则刚切过去再切回来会「点了没反应」）。
+  controller.revokeFull()
+  assert.equal(controller.fullGranted(), false)
+  assert.notEqual(scope.store.webServer.taps[0](SAMPLE_INDEX), SAMPLE_INDEX)
+
+  // 窗口自然过期 —— 这就是「不保留上次选择」：连下一次都不用，时间一到就回精简。
+  runtime.fullUntil = Date.now() - 1
+  assert.equal(controller.fullGranted(), false)
+  assert.equal(controller.liteEnabled(), true)
+})
+
+test('控制器：config.lite=false 是硬开关，谁也没法让它发精简页', () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = freshRuntime({})
+  const controller = createLiteController(scope, { ...CONFIG, lite: false }, runtime)
+  assert.equal(controller.liteEnabled(), false)
+  // 反过来一样：配置关了，就算有人塞了授权窗口也还是完整页（本来就是完整页）。
+  controller.grantFull()
+  assert.equal(controller.liteEnabled(), false)
+  assert.equal(scope.store.webServer.taps[0](SAMPLE_INDEX), SAMPLE_INDEX)
 })
 
 test('精简合并请求：送出的脚本体去掉了 sourceMappingURL，且带上不可变缓存头', async () => {
@@ -834,39 +854,38 @@ test('精简合并请求：非本路由 / 别的 rev / 非 GET 都拒绝', async
   assert.equal(await call('POST', '/remote-lite-plugins/??@x/client.js&rev=stale'), 405)
 })
 
-test('精简开关端点：写盘、活状态、以及缺 enabled 时的 400', async () => {
+test('精简开关端点：一次性授权窗口、绝不写盘、以及缺 enabled 时的 400', async () => {
   const scope = liteScope({ graph: SAMPLE_GRAPH })
   const runtime = readyRuntime(scope)
   runtime.liteController = createLiteController(scope, LITE_CONFIG, runtime)
   registerAdminRoutes(scope, LITE_CONFIG, runtime, MEMORY_DEPS)
   const route = routeFor(scope, LITE_PATH)
 
-  // 缺 enabled → 400，且不能改动活状态。
+  // 缺 enabled → 400，且不能改动任何状态。
   const bad = await route.fetch({ json: async () => ({}) })
   assert.equal(bad.status, 400)
-  assert.equal(runtime.liteChoice, undefined)
+  assert.equal(runtime.fullUntil, 0)
 
-  // 明确关闭 → 活状态变 false，且**经 deps 写**进状态文件。
+  // 「切至完整模式」→ 只开一个 20 秒的授权窗口（页面立刻发完整页），**不写盘**。
   const off = await route.fetch({ json: async () => ({ enabled: false }) })
   assert.equal(off.status, 200)
   const offBody = await off.json()
   assert.equal(offBody.ok, true)
-  assert.equal(offBody.lite, false)
-  assert.equal(runtime.liteChoice, false)
-  assert.equal(runtime.state.lite, false, '必须写盘，否则重启就回默认值了')
-  // 关键：写盘必须走注入进来的 deps —— 漏了它就会去写真实的
-  // ~/.dsh/tailscale-remote.json，把用户的持久登录密钥覆盖掉。
-  assert.equal(scope.store.__persisted.length, 1, '必须通过 deps 写盘')
-  assert.equal(scope.store.__persisted[0].lite, false)
+  assert.equal(offBody.lite, false, '窗口内宿主会发完整页')
+  assert.equal(offBody.fullGranted, true)
+  const window = runtime.fullUntil - Date.now()
+  assert.ok(window > 0 && window <= FULL_PAGE_GRANT_MS, `窗口长度必须落在 (0, ${FULL_PAGE_GRANT_MS}] 里，实际 ${window}`)
+  // 用户的要求就是「不保留上次选择」：这条路径**一个字节**都不该落地。
+  // （早先它写过状态文件，还因此把用户的持久登录密钥覆盖过一次。）
+  assert.equal(scope.store.__persisted, undefined, '切换精简模式绝不能写盘')
 
-  // 再打开 → 立刻生效。
+  // 「切至精简模式」→ 立刻撤销窗口，刷新即回精简。
   const on = await route.fetch({ json: async () => ({ enabled: true }) })
-  assert.equal((await on.json()).lite, true)
-  assert.equal(runtime.liteChoice, true)
-  assert.equal(scope.store.__persisted.length, 2)
-  assert.equal(scope.store.__persisted[1].lite, true)
-  // 写盘的内容必须保住别的字段（尤其 loginSecret —— 丢了它重启就换密钥了）。
-  assert.equal(scope.store.__persisted[1].loginSecret, runtime.state.loginSecret)
+  const onBody = await on.json()
+  assert.equal(onBody.lite, true)
+  assert.equal(onBody.fullGranted, false)
+  assert.equal(runtime.fullUntil, 0)
+  assert.equal(scope.store.__persisted, undefined)
 })
 
 test('精简开关端点：控制器缺席时明确拒绝（这台 DSH 没有 Web 渲染路径）', async () => {
@@ -879,16 +898,35 @@ test('精简开关端点：控制器缺席时明确拒绝（这台 DSH 没有 We
   assert.equal((await response.json()).ok, false)
 })
 
-test('状态端点如实报告精简模式的「选择」与「这份页面是否真的被裁了」', async () => {
+test('精简开关端点：config.lite=false 时拒绝（硬开关不能靠按钮翻过来）', async () => {
+  const scope = liteScope({ graph: SAMPLE_GRAPH })
+  const runtime = readyRuntime(scope)
+  runtime.liteController = createLiteController(scope, { ...CONFIG, lite: false }, runtime)
+  registerAdminRoutes(scope, { ...CONFIG, lite: false }, runtime, MEMORY_DEPS)
+
+  const response = await routeFor(scope, LITE_PATH).fetch({ json: async () => ({ enabled: false }) })
+  assert.equal(response.status, 409)
+  assert.equal(runtime.fullUntil, 0, '拒绝时不能偷偷开窗口')
+})
+
+test('状态端点如实报告精简模式：默认精简、窗口内完整、没有「上次的选择」这个字段', async () => {
   const scope = liteScope({ graph: SAMPLE_GRAPH })
   const runtime = readyRuntime(scope)
   runtime.liteController = createLiteController(scope, LITE_CONFIG, runtime)
   registerAdminRoutes(scope, LITE_CONFIG, runtime, MEMORY_DEPS)
 
   const before = await (await routeFor(scope, STATE_PATH).fetch()).json()
-  assert.equal(before.lite, true)
+  assert.equal(before.lite, true, '默认永远是精简页')
   assert.equal(before.liteAvailable, true)
-  assert.equal(before.liteChoice, null, '还没选过就是 null（不是 false）')
+  assert.equal(before.liteFullGranted, false)
+  assert.equal('liteChoice' in before, false, '「用户上次选了什么」这个概念必须彻底消失')
+
+  // 按了切至完整模式之后，状态端点如实报告那个窗口还开着。
+  runtime.liteController.grantFull()
+  const granted = await (await routeFor(scope, STATE_PATH).fetch()).json()
+  assert.equal(granted.lite, false)
+  assert.equal(granted.liteFullGranted, true)
+  runtime.liteController.revokeFull()
 
   // 真的渲染一次，liteCount 才有值。
   scope.store.webServer.taps[0](SAMPLE_INDEX)
@@ -903,8 +941,7 @@ test('状态端点如实报告精简模式的「选择」与「这份页面是�
   const bareBody = await (await routeFor(bare, STATE_PATH).fetch()).json()
   assert.equal(bareBody.liteAvailable, false)
   assert.equal(bareBody.lite, null)
-
-  // 配置默认值也要报出来，用户才知道「不选的话是哪一版」。
+  // 配置硬开关那一项也要报出来，用户才知道这台实例到底做不做这件事。
   assert.equal(bareBody.liteDefault, true)
 })
 

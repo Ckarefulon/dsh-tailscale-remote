@@ -366,16 +366,6 @@ window.__ModuleLoader__.load({
 
 			const hint = describePhase(t, state)
 
-			/**
-			 * 「这份页面跑的是哪一版」。
-			 *
-			 * 读的是宿主在改写 index 时种下的标记，**不是** `__DSH_BOOT__` 的行数：
-			 * 后者是拿数字当契约，DSH 一升级就骗人。标记只说明这一份页面是不是精简版，
-			 * 与整图长什么样无关。拿不到标记（桌面端、或完整版页面）时为 undefined。
-			 */
-			const thisPageIsLite =
-				typeof globalThis !== 'undefined' && globalThis.__DSH_TAILSCALE_REMOTE_LITE__ === 'lite'
-
 			return h(
 				'div',
 				{ style: styles.row, 'data-dsh-tailscale-remote-row': '' },
@@ -472,6 +462,25 @@ window.__ModuleLoader__.load({
 						)
 					: h('div', { style: styles.hint }, hint),
 			)
+		}
+
+		/**
+		 * 「这一份页面跑的是哪一版」。
+		 *
+		 * 读的是宿主在改写 index 时种下的标记（`globalThis.__DSH_TAILSCALE_REMOTE_LITE__`），
+		 * **不是** `__DSH_BOOT__` 的行数：后者是拿数字当契约，DSH 一升级就骗人；也不是
+		 * 状态端点里的 `lite` —— 那个说的是「宿主下一次渲染会不会裁」，而按钮必须按
+		 * **正在看的这份页面**说话，否则点下去会发生「文案说切到完整、页面本来就完整」。
+		 *
+		 * 拿不到标记（桌面端、配置关了精简、或本来就是完整版页面）时返回 false。
+		 * @returns 这一份页面是不是精简版。
+		 */
+		function pageIsLite() {
+			try {
+				return typeof globalThis === 'undefined' ? false : globalThis.__DSH_TAILSCALE_REMOTE_LITE__ === 'lite'
+			} catch {
+				return false
+			}
 		}
 
 		/**
@@ -594,8 +603,17 @@ window.__ModuleLoader__.load({
 		 *
 		 * 只有一条规则：**这个按钮永远在，点它就在两种模式之间切**。
 		 *
-		 *   - 精简模式  → 文案/提示是「切至完整模式」，点完 → 完整模式
-		 *   - 完整模式  → 文案/提示是「切至精简模式」，点完 → 精简模式
+		 *   - 精简页  → 文案/提示是「切至完整模式」，点完 → 这一次的完整页
+		 *   - 完整页  → 文案/提示是「切至精简模式」，点完 → 精简页
+		 *
+		 * 但**「完整」不保留**（用户定下的规则）：远程端每次连上来都是精简模式，
+		 * 按按钮只是让**紧接着的那一次加载**变成完整页；关掉页面、重新连、过一会儿再
+		 * 刷新，都是精简页。宿主那边对应的实现是 `FULL_PAGE_GRANT_MS` 那个一次性窗口，
+		 * 状态不写盘、也没有「上次的选择」。
+		 *
+		 * 因此这个按钮**必须按「正在看的这份页面」说话**（`pageIsLite()`），不能按状态
+		 * 端点里的 `lite` 说话 —— 后者说的是「宿主下一次渲染会不会裁」，两者在切完、
+		 * 重载前的那一刻恰好是相反的，照它说话就会点出「切至完整模式 → 还是完整页」。
 		 *
 		 * 不做「精简模式下才显示」这种条件 —— 那会造成「切到完整模式后没有入口切回
 		 * 来」的死角（我犯过这个错，用户明确报过）。
@@ -622,7 +640,8 @@ window.__ModuleLoader__.load({
 
 			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
 
-			// 读当前状态（只读一次；这个值只用来决定「按钮说切到哪一边」）。
+			// 读当前状态（只读一次）。它现在**只**用来判断「这台 DSH 有没有精简模式可用」；
+			// 按钮说切到哪一边、以及点下去 POST 什么，都按**这份页面**是哪一版来定。
 			const load = useCallback(async () => {
 				const result = await readJson(STATE_PATH)
 				if (result.ok) setState(result.data)
@@ -632,14 +651,22 @@ window.__ModuleLoader__.load({
 				void load()
 			}, [load])
 
+			// 这份页面是精简版吗？每次渲染重读一次全局标记（宿主改写 index 时种下的），
+			// 不缓存：切模式会整页刷新，那份标记跟着换。
+			const lite = pageIsLite()
+
 			const toggle = useCallback(async () => {
 				if (state === null) return
-				const next = state.lite !== true
+				// 切到「另一边」：这份页面是精简 → 要完整（enabled=false 开授权窗口）；
+				// 这份页面是完整 → 要精简（enabled=true 立刻撤销窗口）。
+				//
+				// 后端的语义是**一次性授权**，不是记住选择：只有紧接着的那次加载会拿到
+				// 完整页（窗口见宿主 FULL_PAGE_GRANT_MS），过了窗口或下一次连接又回精简。
 				setBusy(true)
 				const result = await readJson(LITE_PATH, {
 					method: 'POST',
 					headers: { 'content-type': 'application/json' },
-					body: JSON.stringify({ enabled: next }),
+					body: JSON.stringify({ enabled: !lite }),
 				})
 				setBusy(false)
 				// 失败就什么都不做：按钮留在原地，下次点还在。
@@ -653,15 +680,15 @@ window.__ModuleLoader__.load({
 				} catch {
 					/* 拿不到 location 就算了，下次刷新自然生效 */
 				}
-			}, [state])
+			}, [state, lite])
 
 			// 桌面窗口：不渲染（apply 里其实一开始就不会注册）。
 			if (isDesktopWindow()) return null
 			// 还没有状态就不渲染（避免先闪一个文案不对的按钮）。
 			if (state === null || state.liteAvailable !== true) return null
 
-			// 文案说的是「点下去会发生什么」。
-			const label = state.lite === true ? t.liteEnable : t.liteDisable
+			// 文案说的是「点下去会发生什么」：精简页 → 切至完整模式；完整页 → 切至精简模式。
+			const label = lite ? t.liteEnable : t.liteDisable
 			return h(
 				'button',
 				{
