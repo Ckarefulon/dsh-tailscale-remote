@@ -299,9 +299,13 @@ describe('注册', () => {
   it('往「设置 → 通用」注册一行，id 用自己的', () => {
     const { registrations } = applyAndCollect()
     const inject = registrations.filter((r) => r.kind === 'slots.inject')
-    // 两处：设置页那一行（手机链接）+ 侧边栏底部的完整模式开关。
-    assert.equal(inject.length, 2)
-    assert.deepEqual(inject.map((r) => r.name).sort(), ['settings.general.item', 'sidebar.footer.action'])
+    // 三处：设置页那一行（手机链接）+ 侧边栏底部的两格（精简/完整开关、通知铃铛）。
+    assert.equal(inject.length, 3)
+    assert.deepEqual(inject.map((r) => r.name).sort(), [
+      'settings.general.item',
+      'sidebar.footer.action',
+      'sidebar.footer.action',
+    ])
     assert.equal(inject[0].name, 'settings.general.item', '这一行的座位就是通用设置的行插槽')
 
     // register 只在 inject 回调里发生 —— 这正是「插槽还没声明时不要硬注册」的写法。
@@ -479,13 +483,17 @@ describe('渲染出来的一行', () => {
     assert.ok(text.includes('更换密钥'), '换密钥还在')
   })
 
-  it('绝不用 emoji 当图标（DSH 的图标语言里没有 emoji）', () => {
+  it('图标绝不用 emoji（🟢🟡🔴 只允许出现在通知标题那三条文案里）', () => {
     const source = readFileSync(join(root, 'client', 'client.js'), 'utf8')
-    assert.equal(
-      /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/u.test(source),
-      false,
-      'bundle 里出现了 emoji 码点',
-    )
+    const emoji = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/u
+    const allowed = /notify(?:Done|Question|Error)Title:/
+    const offenders = source
+      .split('\n')
+      .filter((line) => emoji.test(line) && !allowed.test(line))
+      .map((line) => line.trim())
+    assert.deepEqual(offenders, [], 'emoji 只能当通知文案，不能当图标')
+    // 顺带保证那三条文案真的还在（否则上面那条断言会变成「哪里都没有 emoji」的空转）。
+    assert.equal((source.match(/notify(?:Done|Question|Error)Title:/g) ?? []).length, 6, '中英各三条通知标题')
   })
 
   it('客户端写死的三个路径与宿主注册的逐字一致', () => {
@@ -908,8 +916,338 @@ describe('桌面端一个字节都不准动', () => {
   it('手机页面（没有 dshDesktopBoot）里照常注册', () => {
     const { registrations } = applyAndCollect({ window: {} })
     const injects = registrations.filter((r) => r.kind === 'slots.inject')
-    assert.equal(injects.length, 2, '手机页面上要注册设置行 + 底部图标')
+    assert.equal(injects.length, 3, '手机页面上要注册设置行 + 底部两格（切换、通知）')
   })
 
 
+})
+
+describe('状态通知（浏览器这一半）', () => {
+  const STATE_ENDPOINT = '/api/dsh-tailscale-remote/state'
+  const FEED_ENDPOINT = '/api/dsh-tailscale-remote/notify/feed'
+  const SWITCH_ENDPOINT = '/api/dsh-tailscale-remote/notify'
+  const DEVICE_KEY = 'dsh-tailscale-remote.notify'
+  const ZH_LOCALE = { getSnapshot: () => ({ active: 'zh', locales: [], revision: 1 }), subscribe: () => () => {} }
+
+  /** 假的通知实现：记下每次弹出的标题、正文与 tag。 */
+  function fakeNotifications(permission = 'granted') {
+    const shown = []
+    function FakeNotification(title, options) {
+      shown.push({ title, body: options?.body, tag: options?.tag })
+      this.close = () => {}
+      this.onclick = null
+    }
+    FakeNotification.permission = permission
+    FakeNotification.requestPermission = async () => permission
+    return { Notification: FakeNotification, shown }
+  }
+
+  /** 假的 localStorage。 */
+  function fakeStorage() {
+    const map = new Map()
+    return {
+      map,
+      getItem: (key) => (map.has(key) ? map.get(key) : null),
+      setItem: (key, value) => map.set(key, String(value)),
+      removeItem: (key) => map.delete(key),
+    }
+  }
+
+  /**
+   * 只记录、不真正计时的定时器。
+   *
+   * 重要性不在于「测得准」，而在于**测试进程不能被 interval 吊住**：真实 setInterval
+   * 会让 node --test 永远不退出。
+   */
+  function fakeTimers() {
+    const entries = []
+    return {
+      entries,
+      setInterval: (fn, ms) => {
+        entries.push({ fn, ms })
+        return entries.length
+      },
+      clearInterval: (id) => {
+        const entry = entries[id - 1]
+        if (entry !== undefined) entry.cleared = true
+      },
+    }
+  }
+
+  /** 状态端点 + 通知 feed + 总开关端点的桩（总开关是有状态的，点一下要真的翻）。 */
+  function notifyFetch({ state = {}, feed = () => ({ notify: true, cursor: 0, events: [] }) } = {}) {
+    let notify = state.notify !== false
+    return async (path, options) => {
+      if (path === STATE_ENDPOINT) {
+        return {
+          status: 200,
+          json: async () => ({
+            ok: true,
+            phase: 'ready',
+            canRotate: false,
+            loginUrl: null,
+            plainUrl: null,
+            cookieMaxAgeDays: 3650,
+            notifyAvailable: true,
+            ...state,
+            notify,
+          }),
+        }
+      }
+      if (path.startsWith(FEED_ENDPOINT)) {
+        const since = path.includes('since=') ? Number(path.slice(path.indexOf('since=') + 6)) : null
+        return { status: 200, json: async () => ({ ok: true, ...feed(since) }) }
+      }
+      if (path === SWITCH_ENDPOINT) {
+        notify = JSON.parse(options.body).enabled === true
+        return { status: 200, json: async () => ({ ok: true, notify, persisted: false }) }
+      }
+      throw new Error(`unexpected ${path}`)
+    }
+  }
+
+  /** 一个假的浏览器环境：通知 + localStorage + 定时器全套。 */
+  function browserEnv({ permission = 'granted', alerts = [], document: doc } = {}) {
+    const notes = fakeNotifications(permission)
+    const storage = fakeStorage()
+    const timers = fakeTimers()
+    return {
+      notes,
+      storage,
+      timers,
+      alerts,
+      window: {
+        Notification: notes.Notification,
+        localStorage: storage,
+        setInterval: timers.setInterval,
+        clearInterval: timers.clearInterval,
+        alert: (message) => alerts.push(message),
+      },
+      document: doc,
+    }
+  }
+
+  /** 渲染底部那一格的铃铛（id 以 -notify 结尾的那个注册）。 */
+  async function renderBell(overrides = {}) {
+    const env = applyAndCollect(overrides)
+    for (const inject of env.registrations.filter((r) => r.kind === 'slots.inject')) inject.register()
+    const registration = env.registrations.find(
+      (r) => r.kind === 'slots.register' && r.definition.id === 'dsh-tailscale-remote-notify',
+    )
+    assert.ok(registration !== undefined, '必须给铃铛单独占一格（id 不能和切换按钮重复）')
+    const props = registration.definition.inject()
+    env.renderer.render(registration.component, props)
+    await env.renderer.flush()
+    const tree = env.renderer.render(registration.component, props)
+    await env.renderer.flush()
+    return { ...env, tree, registration, props }
+  }
+
+  /** 在元素树里找第一个满足谓词的节点。 */
+  function findBy(node, predicate) {
+    if (node === null || node === undefined || typeof node !== 'object') return undefined
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = findBy(child, predicate)
+        if (hit !== undefined) return hit
+      }
+      return undefined
+    }
+    if (predicate(node)) return node
+    if (node.children !== undefined) {
+      for (const child of node.children) {
+        const hit = findBy(child, predicate)
+        if (hit !== undefined) return hit
+      }
+    }
+    return undefined
+  }
+
+  /** 从渲染结果里收集所有字符串。 */
+  function stringsOf(node, out = []) {
+    if (node === null || node === undefined || typeof node === 'boolean') return out
+    if (typeof node === 'string') {
+      out.push(node)
+      return out
+    }
+    if (Array.isArray(node)) {
+      for (const child of node) stringsOf(child, out)
+      return out
+    }
+    if (typeof node === 'object' && node.children !== undefined) stringsOf(node.children, out)
+    return out
+  }
+
+  it('宿主没开这个功能时不占那一格', async () => {
+    const env = browserEnv()
+    const { tree } = await renderBell({
+      locale: ZH_LOCALE,
+      fetch: notifyFetch({ state: { notifyAvailable: false } }),
+      window: env.window,
+    })
+    assert.equal(tree, null)
+  })
+
+  it('浏览器不支持通知时也不占那一格（否则点一下只能得到一句骂）', async () => {
+    const { tree } = await renderBell({ locale: ZH_LOCALE, fetch: notifyFetch() })
+    assert.equal(tree, null)
+  })
+
+  it('支持的时候是一个带状态的按钮：关着', async () => {
+    const env = browserEnv()
+    const { tree } = await renderBell({ locale: ZH_LOCALE, fetch: notifyFetch(), window: env.window })
+    assert.ok(tree !== null, '应当渲染出铃铛')
+    assert.equal(tree.type, 'button')
+    assert.equal(tree.props['aria-pressed'], false)
+    assert.equal(tree.props['data-dsh-tailscale-remote-notify'], 'off')
+    assert.match(tree.props.title, /关/)
+    // 关着的时候不该有任何后台轮询（否则每个页面都在白耗电）。
+    assert.equal(env.timers.entries.length, 0)
+  })
+
+  it('点一下：要权限、记本机、开始轮询、并立刻弹一条确认', async () => {
+    const env = browserEnv()
+    const { tree, renderer, registration, props, calls } = await renderBell({
+      locale: ZH_LOCALE,
+      fetch: notifyFetch(),
+      window: env.window,
+    })
+
+    tree.props.onClick()
+    await renderer.flush()
+
+    assert.equal(env.storage.map.get(DEVICE_KEY), '1', '本机选择要落到 localStorage')
+    assert.equal(env.timers.entries.length, 1, '开启后必须有且只有一个轮询定时器')
+    assert.equal(env.timers.entries[0].ms, 4000)
+    // 第一跳只对表，不带 since。
+    const feedCall = calls.find((call) => call.path.startsWith(FEED_ENDPOINT))
+    assert.ok(feedCall !== undefined)
+    assert.equal(feedCall.path.includes('since='), false, '第一次只对表，不许回放历史')
+    // 确认通知：点完什么反馈都没有会让人以为没点上。
+    assert.equal(env.notes.shown.length, 1)
+    assert.equal(env.notes.shown[0].title, '状态通知已开启')
+
+    const next = renderer.render(registration.component, props)
+    await renderer.flush()
+    assert.equal(next.props['data-dsh-tailscale-remote-notify'], 'on')
+  })
+
+  it('浏览器拒了权限：不开启、不轮询、并明确告诉用户', async () => {
+    const alerts = []
+    const env = browserEnv({ permission: 'denied', alerts })
+    const { tree, renderer, calls } = await renderBell({
+      locale: ZH_LOCALE,
+      fetch: notifyFetch(),
+      window: env.window,
+    })
+
+    tree.props.onClick()
+    await renderer.flush()
+
+    assert.equal(env.storage.map.has(DEVICE_KEY), false)
+    assert.equal(env.timers.entries.length, 0)
+    assert.equal(env.notes.shown.length, 0)
+    assert.equal(calls.some((call) => call.path.startsWith(FEED_ENDPOINT)), false)
+    assert.equal(alerts.length, 1)
+    assert.match(alerts[0], /通知权限/)
+  })
+
+  it('收到事件时按类别弹通知（🟢 / 🟡 / 🔴），正文带会话标题', async () => {
+    const events = [
+      { seq: 8, kind: 'done', sessionId: 's1', sessionTitle: '修登录 bug' },
+      { seq: 9, kind: 'question', sessionId: 's1', sessionTitle: '修登录 bug', detail: 'bash' },
+      { seq: 10, kind: 'error', sessionId: 's2', sessionTitle: '迁移数据库', detail: 'connection reset' },
+    ]
+    const env = browserEnv()
+    // 本机已开启：走进真实路径 —— 挂载 effect 自己把轮询拉起来。
+    env.storage.setItem(DEVICE_KEY, '1')
+    // 第一跳给游标与空事件，第二跳才给真事件 —— 与真实宿主一致。
+    let round = 0
+    const feed = () => {
+      round += 1
+      return round === 1 ? { notify: true, cursor: 7, events: [] } : { notify: true, cursor: 10, events }
+    }
+    const { renderer } = await renderBell({ locale: ZH_LOCALE, fetch: notifyFetch({ feed }), window: env.window })
+    await renderer.flush()
+
+    assert.equal(env.timers.entries.length, 1, '本机已开启 + 权限在 → 应该已经开轮询')
+    // 手动触发一次轮询回调：拿到 3 条事件。
+    await env.timers.entries[0].fn()
+    await renderer.flush()
+
+    assert.equal(env.notes.shown.length, 3, `实际 ${env.notes.shown.length} 条`)
+    assert.deepEqual(
+      env.notes.shown.map((note) => note.title),
+      ['🟢 会话完成', '🟡 等待你的确认', '🔴 会话意外中断'],
+    )
+    assert.match(env.notes.shown[0].body, /修登录 bug/)
+    assert.match(env.notes.shown[1].body, /bash/)
+    assert.match(env.notes.shown[2].body, /connection reset/)
+  })
+
+  it('页面正被看着时不弹（那条消息本来就在眼前）', async () => {
+    const env = browserEnv({ document: { visibilityState: 'visible', hasFocus: () => true } })
+    env.storage.setItem(DEVICE_KEY, '1')
+    let round = 0
+    const feed = () => {
+      round += 1
+      return round === 1
+        ? { notify: true, cursor: 1, events: [] }
+        : { notify: true, cursor: 2, events: [{ seq: 2, kind: 'done', sessionId: 's1', sessionTitle: 'x' }] }
+    }
+    const { renderer } = await renderBell({
+      locale: ZH_LOCALE,
+      fetch: notifyFetch({ feed }),
+      window: env.window,
+      document: env.document,
+    })
+    await renderer.flush()
+
+    assert.equal(env.timers.entries.length, 1, '本机已开启 + 权限在 → 应该已经开轮询')
+    await env.timers.entries[0].fn()
+    await renderer.flush()
+    assert.equal(env.notes.shown.length, 0, '用户正看着页面，不该弹系统通知')
+  })
+
+  it('宿主总闸关着时收到的事件也不弹', async () => {
+    const env = browserEnv()
+    env.storage.setItem(DEVICE_KEY, '1')
+    let round = 0
+    const feed = () => {
+      round += 1
+      return round === 1
+        ? { notify: false, cursor: 1, events: [] }
+        : { notify: false, cursor: 2, events: [{ seq: 2, kind: 'done', sessionId: 's1' }] }
+    }
+    const { renderer } = await renderBell({ locale: ZH_LOCALE, fetch: notifyFetch({ feed }), window: env.window })
+    await renderer.flush()
+    await env.timers.entries[0].fn()
+    await renderer.flush()
+    assert.equal(env.notes.shown.length, 0)
+  })
+
+  it('设置页那一行里的总开关：点一下真的 POST，并跟着改文案', async () => {
+    const { tree, renderer, registration, props, calls } = await renderRow({
+      locale: ZH_LOCALE,
+      fetch: notifyFetch({ state: { notify: true } }),
+    })
+    const toggle = findBy(tree, (node) => node.type === 'button' && node.props.role === 'switch')
+    assert.ok(toggle !== undefined, '设置页里必须有那个总开关')
+    assert.equal(toggle.props['aria-checked'], true)
+    assert.equal(stringsOf(toggle).join(''), '已开启')
+
+    toggle.props.onClick()
+    await renderer.flush()
+
+    const posted = calls.find((call) => call.path === SWITCH_ENDPOINT)
+    assert.ok(posted !== undefined, '必须真的打到总开关端点')
+    assert.equal(posted.options.method, 'POST')
+    assert.deepEqual(JSON.parse(posted.options.body), { enabled: false })
+
+    const after = renderer.render(registration.component, props)
+    await renderer.flush()
+    const switched = findBy(after, (node) => node.type === 'button' && node.props.role === 'switch')
+    assert.equal(switched.props['aria-checked'], false)
+    assert.equal(stringsOf(switched).join(''), '已关闭')
+  })
 })

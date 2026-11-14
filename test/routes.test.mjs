@@ -21,6 +21,8 @@ const {
   STATE_PATH,
   ROTATE_PATH,
   LITE_PATH,
+  NOTIFY_FEED_PATH,
+  NOTIFY_PATH,
   FULL_PAGE_GRANT_MS,
 } = internals
 
@@ -124,18 +126,20 @@ function routeFor(scope, path) {
   return route
 }
 
-test('三个端点都注册在 connection.fetch 上（白拿 DSH 的 fence 与 cookie 鉴权）', () => {
+test('五个端点都注册在 connection.fetch 上（白拿 DSH 的 fence 与 cookie 鉴权）', () => {
   const scope = fakeScope()
   registerAdminRoutes(scope, CONFIG, freshRuntime({}), MEMORY_DEPS)
 
   const paths = scope.fetchRoutes.map((r) => r.path).sort()
-  assert.deepEqual(paths, [LITE_PATH, ROTATE_PATH, STATE_PATH].sort())
+  assert.deepEqual(paths, [LITE_PATH, NOTIFY_FEED_PATH, NOTIFY_PATH, ROTATE_PATH, STATE_PATH].sort())
   // 绝不能注册成 webServer 的 exact 路由：那会遮掉整条 /api 前缀路由，
   // 把 Host/Origin fence 和浏览器鉴权一起绕过去。
   assert.deepEqual(scope.registered, [], '不该往 webServer 上注册任何 exact 路由')
   assert.equal(scope.fetchRoutes.find((r) => r.path === STATE_PATH).methods[0], 'GET')
   assert.equal(scope.fetchRoutes.find((r) => r.path === ROTATE_PATH).methods[0], 'POST')
   assert.equal(scope.fetchRoutes.find((r) => r.path === LITE_PATH).methods[0], 'POST')
+  assert.equal(scope.fetchRoutes.find((r) => r.path === NOTIFY_FEED_PATH).methods[0], 'GET')
+  assert.equal(scope.fetchRoutes.find((r) => r.path === NOTIFY_PATH).methods[0], 'POST')
 })
 
 test('状态端点：就绪时给出链接与可换密钥标志', async () => {

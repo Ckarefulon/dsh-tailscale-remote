@@ -73,6 +73,32 @@ window.__ModuleLoader__.load({
 			liteDisable: '切至精简模式',
 			liteSwitchToFull: '切至完整模式',
 			liteSwitchToLite: '切至精简模式',
+			// —— 状态通知 ——
+			notifyTitle: '状态通知',
+			notifyDescription: '会话结束、等你审批或回答、意外中断时，通知已经开启的这个远程页面。',
+			notifySwitchOn: '已开启',
+			notifySwitchOff: '已关闭',
+			notifyRowHint: (on) =>
+				on
+					? '去远程页面点侧边栏底部的铃铛，那台设备才会开始收通知（每台设备各自决定）。'
+					: '总开关关着，远程页面不会收到任何通知。',
+			notifyFailed: '改不了通知开关',
+			notifyPermissionHint: '需要允许通知',
+			notifyDenied: '浏览器没有给通知权限。请在浏览器的站点设置里允许本页通知，再点一次铃铛。',
+			notifyUnsupported: '这个浏览器不支持通知（iPhone / iPad 需要先把页面「添加到主屏幕」再打开）。',
+			notifyEnabledNotice: '状态通知已开启',
+			notifyEnabledBody: '本设备会收到会话结束、等待审批 / 提问、以及意外中断的通知。',
+			notifyBellOn: '状态通知：开（点一下关掉本机通知）',
+			notifyBellOff: '状态通知：关（点一下开启本机通知）',
+			notifyDoneTitle: '🟢 会话完成',
+			notifyQuestionTitle: '🟡 等待你的确认',
+			notifyErrorTitle: '🔴 会话意外中断',
+			notifyUnnamed: '未命名会话',
+			notifyDoneBody: (name) => `《${name}》这一轮已经结束`,
+			notifyQuestionBody: (name, detail) =>
+				detail === undefined ? `《${name}》有一个问题等你回答` : `《${name}》：${detail}`,
+			notifyErrorBody: (name, detail) =>
+				detail === undefined ? `《${name}》中断了，回到页面看看` : `《${name}》：${detail}`,
 		}
 
 		const EN = {
@@ -103,6 +129,32 @@ window.__ModuleLoader__.load({
 			liteDisable: 'Switch to lite',
 			liteSwitchToFull: 'Switch to full mode',
 			liteSwitchToLite: 'Switch to lite mode',
+			// —— status notifications ——
+			notifyTitle: 'Status notifications',
+			notifyDescription: 'Notify remote pages that turned this on when a session finishes, waits for your approval or answer, or breaks.',
+			notifySwitchOn: 'On',
+			notifySwitchOff: 'Off',
+			notifyRowHint: (on) =>
+				on
+					? 'Tap the bell at the bottom of the remote page sidebar to start receiving them on that device (each device decides for itself).'
+					: 'The master switch is off, so no remote page receives notifications.',
+			notifyFailed: 'Could not change notifications',
+			notifyPermissionHint: 'Allow notifications',
+			notifyDenied: 'The browser denied notification permission. Allow notifications for this site in its settings, then tap the bell again.',
+			notifyUnsupported: 'This browser has no notification support (on iPhone / iPad, add the page to the Home Screen first).',
+			notifyEnabledNotice: 'Status notifications on',
+			notifyEnabledBody: 'This device will now be notified when sessions finish, wait for approval or a question, or break.',
+			notifyBellOn: 'Notifications: on (tap to turn this device off)',
+			notifyBellOff: 'Notifications: off (tap to turn this device on)',
+			notifyDoneTitle: '🟢 Session finished',
+			notifyQuestionTitle: '🟡 Waiting for you',
+			notifyErrorTitle: '🔴 Session interrupted',
+			notifyUnnamed: 'Untitled session',
+			notifyDoneBody: (name) => `《${name}》 finished this turn`,
+			notifyQuestionBody: (name, detail) =>
+				detail === undefined ? `《${name}》 has a question for you` : `《${name}》: ${detail}`,
+			notifyErrorBody: (name, detail) =>
+				detail === undefined ? `《${name}》 broke off — open the page` : `《${name}》: ${detail}`,
 		}
 
 		/**
@@ -182,6 +234,21 @@ window.__ModuleLoader__.load({
 				background: 'var(--dsw-alias-state-warn-primary,#b45309)',
 				color: '#fff',
 			},
+			/** 「已开启」那个开关：用成功的绿色，和上面那个橙色的危险动作分开。 */
+			buttonOn: {
+				borderColor: 'transparent',
+				background: 'var(--dsw-alias-state-success-primary,#16a34a)',
+				color: '#fff',
+			},
+			/** 状态通知那一行：左边标题 + 说明，右边开关。 */
+			notifyRow: {
+				display: 'flex',
+				alignItems: 'center',
+				justifyContent: 'space-between',
+				gap: 16,
+			},
+			notifyText: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 },
+			notifyHint: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary,#6b7280)' },
 			hint: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary,#6b7280)' },
 			/**
 			 * 侧边栏底部那个「精简 / 完整」切换按钮。
@@ -238,6 +305,218 @@ window.__ModuleLoader__.load({
 			return { ok: true, data: body }
 		}
 
+		// ————————————————————————————————————————————————————————————————
+		// 状态通知（浏览器这一半）
+		//
+		// 分工是**宿主判定、这里只负责弹**：只有宿主知道这一轮是怎么结束的、谁在等审批、
+		// 以及哪些会话是子代理。浏览器自己去猜（「看着像空闲了」）会漏、会重、而且手机
+		// 一锁屏就全错。
+		//
+		// 为什么是轮询而不是长连接：宿主侧的端点挂在 DSH 的 `/api` 前缀路由上，要做
+		// 长连接就得赌 `Response` 的流式体不被压缩中间件缓冲；而手机浏览器在后台会节流
+		// 定时器、五分钟以上甚至冻结页面 —— 长连接一样会断，还多一套重连要写。一次往返
+		// 只有几百字节、4 秒一次，用最笨的方式换「一定通、一定好测」。
+		// ————————————————————————————————————————————————————————————————
+
+		const NOTIFY_FEED_PATH = '/api/dsh-tailscale-remote/notify/feed'
+		const NOTIFY_PATH = '/api/dsh-tailscale-remote/notify'
+
+		/** 「本设备要不要收」—— 每台设备（每个浏览器）自己决定，存在自己这边。 */
+		const NOTIFY_DEVICE_KEY = 'dsh-tailscale-remote.notify'
+
+		/** 轮询间隔。只管「页面活着的时候够快」；后台被节流是浏览器的事。 */
+		const NOTIFY_POLL_MS = 4000
+
+		/** 当前语言的那份字典（给不在 React 树里的通知轮询用）。 */
+		function notifyDict() {
+			return pickLanguageText((dict) => dict)
+		}
+
+		/** 这个浏览器有没有通知能力（iOS 的 Safari 只有主屏 PWA 里才有）。 */
+		function notificationsSupported() {
+			return typeof globalThis !== 'undefined' && typeof globalThis.Notification === 'function'
+		}
+
+		/** `'unsupported' | 'default' | 'granted' | 'denied'`。 */
+		function notificationPermission() {
+			if (!notificationsSupported()) return 'unsupported'
+			try {
+				return globalThis.Notification.permission ?? 'default'
+			} catch {
+				return 'denied'
+			}
+		}
+
+		/** 申请权限。必须在一次用户手势里调用，所以只从铃铛的 click 走。 */
+		async function requestNotificationPermission() {
+			if (!notificationsSupported()) return 'unsupported'
+			try {
+				return await globalThis.Notification.requestPermission()
+			} catch {
+				return 'denied'
+			}
+		}
+
+		/** 本设备开没开。localStorage 可能被隐私模式禁用 —— 那就当没开。 */
+		function readDeviceNotify() {
+			try {
+				const storage = globalThis.localStorage
+				return storage !== undefined && storage !== null && storage.getItem(NOTIFY_DEVICE_KEY) === '1'
+			} catch {
+				return false
+			}
+		}
+
+		/** 记下本设备的选择（每台设备各管各的，宿主不知道也不需要知道）。 */
+		function writeDeviceNotify(on) {
+			try {
+				const storage = globalThis.localStorage
+				if (storage === undefined || storage === null) return
+				if (on) storage.setItem(NOTIFY_DEVICE_KEY, '1')
+				else storage.removeItem(NOTIFY_DEVICE_KEY)
+			} catch {
+				/* 存不下就是存不下：这一版页面仍然能用，只是刷新后失效 */
+			}
+		}
+
+		/**
+		 * 用户此刻是不是正看着这个页面。
+		 *
+		 * 看着就不弹：人就在页面上，那条消息本来就摆在眼前，再弹一条系统通知只是噪音。
+		 * 判据是「可见 + 有焦点」两条都成立 —— 只看可见的话，切到别的窗口时也算「在看」，
+		 * 那手机一放回口袋就再也不弹了。
+		 */
+		function pageIsBeingWatched() {
+			try {
+				if (typeof document === 'undefined') return false
+				if (document.visibilityState !== 'visible') return false
+				return typeof document.hasFocus === 'function' ? document.hasFocus() : true
+			} catch {
+				return false
+			}
+		}
+
+		/** 说一句人话给用户看。只在用户主动点了铃铛时才用（不是后台提示）。 */
+		function tellUser(message) {
+			try {
+				if (typeof globalThis.alert === 'function') globalThis.alert(message)
+			} catch {
+				/* 弹不出来就算了：铃铛自身的状态也是反馈 */
+			}
+		}
+
+		/**
+		 * 通知轮询器。
+		 *
+		 * 整个模块只有这一份，因为它**必须比组件活得久**：铃铛长在侧边栏底部，切会话时
+		 * React 可能重建它，但「页面开着就有通知」这件事不能跟着断。组件只负责调
+		 * `start()` / `stop()`，游标与定时器都在这里。
+		 */
+		const notifier = {
+			/** 本设备的总开关（localStorage 那一格的内存副本）。 */
+			on: false,
+			/** 上次取到的游标；null = 还没跟宿主对过表。 */
+			cursor: null,
+			timer: null,
+			busy: false,
+			/** 宿主那边的总开关（`feed` 每次都会带回来）。 */
+			hostEnabled: true,
+
+			/**
+			 * 开始轮询。可以重复调用（已经在跑就直接返回）。
+			 *
+			 * 第一次 tick 只对表、不弹历史：页面刚打开时把历史上那几条重弹一遍最招人烦。
+			 */
+			start() {
+				this.on = true
+				if (this.timer !== null) return
+				void this.tick()
+				this.timer = globalThis.setInterval(() => void this.tick(), NOTIFY_POLL_MS)
+			},
+
+			/** 停掉轮询（用户关掉本机通知时）。游标留着，重新打开不会补弹。 */
+			stop() {
+				this.on = false
+				if (this.timer !== null) {
+					globalThis.clearInterval(this.timer)
+					this.timer = null
+				}
+			},
+
+			/** 取一次增量。任何失败都只是跳过这一次 —— 下一轮自然会再试。 */
+			async tick() {
+				if (this.busy) return
+				this.busy = true
+				try {
+					const query = this.cursor === null ? '' : `?since=${String(this.cursor)}`
+					const result = await readJson(`${NOTIFY_FEED_PATH}${query}`)
+					if (!result.ok) return
+					const payload = result.data
+					this.hostEnabled = payload.notify === true
+					const cursor = Number(payload.cursor)
+					const events = Array.isArray(payload.events) ? payload.events : []
+					// cursor === null 的那一次是「对表」：宿主不带 since 就不给事件。
+					if (this.cursor !== null && this.on) for (const event of events) this.show(event)
+					if (Number.isFinite(cursor) && cursor >= 0) this.cursor = cursor
+				} finally {
+					this.busy = false
+				}
+			},
+
+			/** 弹一条。任何一步不满足就安静地不发 —— 通知永远不该变成报错来源。 */
+			show(event) {
+				if (!this.on || !this.hostEnabled) return
+				if (notificationPermission() !== 'granted') return
+				if (pageIsBeingWatched()) return
+				const t = notifyDict()
+				const kind = event?.kind === 'error' ? 'error' : event?.kind === 'question' ? 'question' : 'done'
+				const name =
+					typeof event?.sessionTitle === 'string' && event.sessionTitle !== '' ? event.sessionTitle : t.notifyUnnamed
+				const detail = typeof event?.detail === 'string' && event.detail !== '' ? event.detail : undefined
+				const title =
+					kind === 'error' ? t.notifyErrorTitle : kind === 'question' ? t.notifyQuestionTitle : t.notifyDoneTitle
+				const body =
+					kind === 'error'
+						? t.notifyErrorBody(name, detail)
+						: kind === 'question'
+							? t.notifyQuestionBody(name, detail)
+							: t.notifyDoneBody(name)
+				try {
+					const note = new globalThis.Notification(title, {
+						body,
+						// 同一会话同一类别复用同一条通知，别在通知中心里堆一串。
+						tag: `dsh-${kind}-${String(event?.sessionId ?? '')}`,
+					})
+					note.onclick = () => {
+						try {
+							note.close()
+						} catch {
+							/* 已经关掉了 */
+						}
+						try {
+							globalThis.focus()
+						} catch {
+							/* 拿不到焦点就算了 */
+						}
+					}
+				} catch {
+					/* 非安全上下文 / 权限刚被撤销 / 系统不允许：都不该把轮询弄崩 */
+				}
+			},
+
+			/** 开启成功时的即时反馈。这条刻意**不看**「用户是不是正在看页面」。 */
+			confirmEnabled(t) {
+				try {
+					new globalThis.Notification(t.notifyEnabledNotice, {
+						body: t.notifyEnabledBody,
+						tag: 'dsh-notify-enabled',
+					})
+				} catch {
+					/* 同上 */
+				}
+			},
+		}
+
 		/** 把文案里的阶段/错误翻成人话；认不出来就把原文附在后面。 */
 		function describePhase(t, state) {
 			if (state === null) return t.loading
@@ -264,6 +543,7 @@ window.__ModuleLoader__.load({
 			const [copied, setCopied] = useState(false)
 			const [confirming, setConfirming] = useState(false)
 			const [notice, setNotice] = useState(null)
+			const [notifyBusy, setNotifyBusy] = useState(false)
 			const inputRef = useRef(null)
 
 			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
@@ -346,6 +626,31 @@ window.__ModuleLoader__.load({
 			}, [t])
 
 			const canRotate = state !== null && state.canRotate === true && !busy
+
+			/**
+			 * 状态通知的总开关。
+			 *
+			 * 它是**总闸**：关掉之后任何远程页面都收不到通知（宿主那头连状态都不采集）。
+			 * 「哪台设备收」是第二层，在各自的远程页面上用侧边栏那个铃铛决定 —— 这样
+			 * 不用在宿主这边维护一张设备表（那需要设备标识、注册、过期清理，而收益只有
+			 * 「少点一下」）。
+			 */
+			const toggleNotify = useCallback(async () => {
+				if (state === null || notifyBusy) return
+				setNotifyBusy(true)
+				const result = await readJson(NOTIFY_PATH, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ enabled: state.notify !== true }),
+				})
+				setNotifyBusy(false)
+				if (!result.ok) {
+					setNotice(`${t.notifyFailed}：${result.error}`)
+					return
+				}
+				setNotice(null)
+				setState((previous) => ({ ...(previous ?? {}), notify: result.data.notify === true }))
+			}, [state, notifyBusy, t])
 
 			// 文案必须跟着实际行为走：吊销会话时警告要说清「所有设备都会退出」，
 			// 否则用户以为只是换个链接，结果手机被踢下线、还不知道为什么。
@@ -440,6 +745,31 @@ window.__ModuleLoader__.load({
 						copied ? t.copied : t.copy,
 					),
 				),
+				state === null || state.notifyAvailable !== true
+					? null
+					: h(
+							'div',
+							{ style: styles.notifyRow, 'data-dsh-tailscale-remote-notify-row': '' },
+							h(
+								'div',
+								{ style: styles.notifyText },
+								h('span', { style: styles.label }, t.notifyTitle),
+								h('div', { style: styles.notifyHint }, t.notifyRowHint(state.notify === true)),
+							),
+							h(
+								'button',
+								{
+									type: 'button',
+									role: 'switch',
+									'aria-checked': state.notify === true,
+									'data-dsh-tailscale-remote-notify': state.notify === true ? 'on' : 'off',
+									style: { ...styles.button, ...(state.notify === true ? styles.buttonOn : {}) },
+									disabled: notifyBusy,
+									onClick: () => void toggleNotify(),
+								},
+								state.notify === true ? t.notifySwitchOn : t.notifySwitchOff,
+							),
+						),
 				confirming ? h('div', { style: styles.warn }, warningText) : null,
 				notice === null ? null : h('div', { style: styles.warn }, notice),
 				error !== null
@@ -703,6 +1033,145 @@ window.__ModuleLoader__.load({
 				h(LiteSwitchIcon, { size: 16, strokeWidth: 1 }),
 			)
 		}
+		/** 铃铛图标（16×16，DSH 图标规范）。关着的时候多一道斜杠。 */
+		function NotifyBellIcon(props) {
+			const size = props?.size ?? 16
+			const on = props?.on === true
+			return h(
+				'svg',
+				{
+					width: size,
+					height: size,
+					viewBox: '0 0 16 16',
+					fill: 'none',
+					xmlns: 'http://www.w3.org/2000/svg',
+					'aria-hidden': 'true',
+					strokeWidth: props?.strokeWidth ?? 1,
+				},
+				h('path', {
+					d: 'M8 2.2c-1.9 0-3.2 1.4-3.2 3.2v2.4L3.4 10h9.2L11.2 7.8V5.4C11.2 3.6 9.9 2.2 8 2.2Z',
+					stroke: 'currentColor',
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+				}),
+				h('path', {
+					d: 'M6.5 12.2a1.6 1.6 0 0 0 3 0',
+					stroke: 'currentColor',
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+				}),
+				on ? null : h('path', { d: 'M2.6 2.6 13.4 13.4', stroke: 'currentColor', strokeLinecap: 'round' }),
+			)
+		}
+
+		/**
+		 * 「本设备收不接收通知」的那个铃铛。
+		 *
+		 * 长在 `sidebar.footer.action` 里，紧挨着精简/完整切换按钮 —— 理由与那个按钮
+		 * 完全一样（见 `LiteSwitch` 的注释）：这一格由 `ui-sidebar` 声明，与
+		 * `ui-settings-general` 无关，所以精简页面和完整页面上都一定在。
+		 *
+		 * 为什么开关在这里而不在设置里：**精简页面上没有「设置 → 通用」那个插槽**
+		 * （`ui-settings-general` 不传给手机），而「哪台设备要收通知」恰恰只能在设备上
+		 * 决定。宿主那边的设置页里放的是总闸（`RemoteRow`），两者分工不同：
+		 *   总闸（本机设置）——关掉就全都不发；
+		 *   铃铛（每台设备）——决定**这台**要不要收。
+		 *
+		 * 只有当宿主开着这个功能、并且浏览器支持通知时才出现；否则不占这一格。
+		 * @param props - 插槽注入面给的 `{ ctx }`，加上宿主传的 `{ wide }`。
+		 */
+		function NotifySwitch(props) {
+			const ctx = props.ctx
+			const [state, setState] = useState(null)
+			const [on, setOn] = useState(() => readDeviceNotify())
+			const [busy, setBusy] = useState(false)
+			const [, setTick] = useState(0)
+
+			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
+
+			const load = useCallback(async () => {
+				const result = await readJson(STATE_PATH)
+				if (result.ok) setState(result.data)
+			}, [])
+
+			useEffect(() => {
+				void load()
+			}, [load])
+
+			useEffect(() => {
+				const locale = (() => {
+					try {
+						return ctx.get('locale')
+					} catch {
+						return undefined
+					}
+				})()
+				if (locale === undefined || typeof locale.subscribe !== 'function') return undefined
+				return locale.subscribe(() => setTick((n) => n + 1))
+			}, [ctx])
+
+			// 本机开着 + 宿主开着 + 权限还在 → 一直轮询；任何一条不成立就停。
+			// 这三条都要：只按本机记忆开轮询的话，用户在设置里关掉总闸后，
+			// 各个远程页面会继续每 4 秒问一次「有没有新通知」，白耗电。
+			const hostOn = state !== null && state.notify === true
+			useEffect(() => {
+				if (on && hostOn && notificationPermission() === 'granted') notifier.start()
+				else notifier.stop()
+			}, [on, hostOn])
+
+			const toggle = useCallback(async () => {
+				if (busy) return
+				setBusy(true)
+				try {
+					if (on) {
+						writeDeviceNotify(false)
+						setOn(false)
+						notifier.stop()
+						return
+					}
+					if (!notificationsSupported()) {
+						tellUser(t.notifyUnsupported)
+						return
+					}
+					let permission = notificationPermission()
+					// 申请权限必须在用户手势里，所以只有这一条路径会问。
+					if (permission === 'default') permission = await requestNotificationPermission()
+					if (permission !== 'granted') {
+						tellUser(t.notifyDenied)
+						return
+					}
+					writeDeviceNotify(true)
+					setOn(true)
+					notifier.start()
+					// 立刻弹一条确认：用户点完铃铛看不到任何反馈，会以为没点上。
+					notifier.confirmEnabled(t)
+				} finally {
+					setBusy(false)
+				}
+			}, [busy, on, t])
+
+			// 浏览器根本推不了通知：这一格不出现（点了只会得到一个弹窗骂它不支持）。
+			if (!notificationsSupported()) return null
+			// 还没读到宿主状态：先不渲染，免得先闪一个状态不对的铃铛。
+			if (state === null || state.notifyAvailable !== true) return null
+
+			const label = on ? t.notifyBellOn : t.notifyBellOff
+			return h(
+				'button',
+				{
+					type: 'button',
+					style: styles.footerSwitch,
+					disabled: busy,
+					title: label,
+					'aria-label': label,
+					'aria-pressed': on,
+					'data-dsh-tailscale-remote-notify': on ? 'on' : 'off',
+					onClick: () => void toggle(),
+				},
+				h(NotifyBellIcon, { size: 16, strokeWidth: 1, on }),
+			)
+		}
+
 		/**
 		 * 注册这个插件的两处界面。
 		 *
@@ -719,7 +1188,11 @@ window.__ModuleLoader__.load({
 		 *      它都在。（早先几版把它寄生在设置按钮上，于是「抽掉设置组件」时它跟着
 		 *      消失 —— 那是个设计错误，不是巧合。）
 		 *
-		 * 桌面窗口里第 1 项照旧注册（那是插件原本就有的功能），第 2 项不注册。
+		 *   3. **状态通知的铃铛** —— 同一个 `sidebar.footer.action`，第二个座位。
+		 *      它和切换按钮的存活条件完全一样（远程页面 + 插槽在），只是多两条：
+		 *      宿主开着通知功能、浏览器支持通知。
+		 *
+		 * 桌面窗口里第 1 项照旧注册（那是插件原本就有的功能），第 2、3 项不注册。
 		 *
 		 * 用 `slots.inject` 而不是 `slots.register` 直调：插槽由别的包声明，它和本包的
 		 * 激活顺序没有保证。
@@ -752,6 +1225,19 @@ window.__ModuleLoader__.load({
 						inject: () => ({ ctx }),
 					},
 					LiteSwitch,
+				),
+			)
+
+			// 状态通知的铃铛：同一格的第二个座位（id 必须不同，否则会顶掉切换按钮）。
+			ctx.slots.inject('sidebar.footer.action', () =>
+				ctx.slots.register(
+					{
+						name: 'sidebar.footer.action',
+						id: `${ROW_ID}-notify`,
+						order: 11,
+						inject: () => ({ ctx }),
+					},
+					NotifySwitch,
 				),
 			)
 		}

@@ -131,6 +131,13 @@ function normalizeConfig(raw) {
     // 给 DSH 的 WebSocket（`/api/remote.mux`，会话历史走它）开 permessage-deflate。
     // 这是「手机拉会话历史慢」的主因：那条 WS 默认完全不压缩。
     websocketCompression: source.websocketCompression !== false,
+    // 状态通知（默认开）：会话结束（🟢）/ 等你审批或回答（🟡）/ 意外中断（🔴）时，
+    // 给**远程页面**推一条浏览器通知。
+    //
+    // 这是**硬开关**：false = 这台实例根本不采集状态、也不注册推送端点，设置页里
+    // 那个开关和远程页面上那个铃铛都不出现。打开时还有第二层（运行期）总开关，
+    // 见 `runtime.notifyEnabled`。
+    notify: source.notify !== false,
   }
 }
 
@@ -1050,6 +1057,12 @@ function statePayload(config, runtime) {
     liteDefault: config.lite,
     liteCount: runtime.lite?.ids?.length ?? null,
     litePreloadRemoved: runtime.lite?.removed ?? null,
+    // 状态通知：`notify` = 此刻会不会发（配置 + 运行期总开关都为真），
+    // `notifyAvailable` = 这台实例有没有这个能力（配置没关掉）。客户端两件事分开用：
+    // 前者说话「现在开没开」，后者说话「这个开关该不该出现」。
+    notify: config.enabled && config.notify && runtime.notifyEnabled === true,
+    notifyAvailable: config.enabled && config.notify,
+    notifyPending: runtime.notify.events.length,
   }
 }
 
@@ -1188,6 +1201,285 @@ async function rotateLoginSecret(scope, config, runtime, deps = REAL_DEPS, reque
 }
 
 /**
+ * 状态通知的两个端点（和设置页那两个一样挂在 `connection.fetch` 上）：
+ * `feed` 取增量事件，`notify` 改运行期总开关。
+ */
+const NOTIFY_FEED_PATH = '/api/dsh-tailscale-remote/notify/feed'
+const NOTIFY_PATH = '/api/dsh-tailscale-remote/notify'
+
+/** 事件缓冲上限。客户端 4 秒来取一次，32 条足够覆盖一分钟的突发。 */
+const NOTIFY_EVENTS_MAX = 32
+
+/** 事件存活时长。手机锁屏一小时再回来时，别把旧事当新事翻出来。 */
+const NOTIFY_EVENT_TTL_MS = 30 * 60 * 1000
+
+/**
+ * 同类同会话的去重窗口。
+ *
+ * 一次失败常常从两条链路各报一次（`session/event` 的 `turn/end(error)` 与
+ * `api-session/error`），不去重的话手机上会弹两条一模一样的「意外中断」。
+ */
+const NOTIFY_DEDUPE_MS = 5000
+
+/** 压成一行并截断 —— 通知正文只有一两行的位置。 */
+function clipText(text) {
+  const flat = String(text).replace(/\s+/gu, ' ').trim()
+  if (flat === '') return undefined
+  return flat.length > 160 ? `${flat.slice(0, 157)}…` : flat
+}
+
+/** 从任意错误值里抠出一句人话。永不抛。 */
+function errorText(error) {
+  if (error === null || error === undefined) return undefined
+  if (typeof error === 'string') return clipText(error)
+  if (typeof error.message === 'string') return clipText(error.message)
+  try {
+    return clipText(JSON.stringify(error))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * `turn/end` 的 reason → 通知类别。
+ *
+ * 只认两种：`completed`（这一轮干完了 → 🟢）与 `error`（这一轮炸了 → 🔴）。
+ * 其余（用户按停止 `aborted(user)`、`interrupted`、`max-tokens`、`blocked`）**不发**：
+ * 用户自己停的不需要通知他；上下文不够 / 被策略挡下属于「还能接着操作」的中间态，
+ * 每轮都弹一次只会让人把通知关掉。
+ * @param reason - `turn/end` 事件里的 `reason`。
+ * @returns `{ kind, detail }`，与通知无关时 undefined。
+ */
+function classifyTurnEnd(reason) {
+  if (reason === null || typeof reason !== 'object') return undefined
+  if (reason.kind === 'completed') return { kind: 'done', detail: undefined }
+  if (reason.kind === 'error') return { kind: 'error', detail: errorText(reason.error) }
+  return undefined
+}
+
+/**
+ * 找这条会话的**活** Session 对象。
+ *
+ * 事件里给的有时是 Session（`session/event`），有时只是个 `{ id }`（`Agent`），
+ * 所以统一回落到 `ctx.sessions` 的活表去查 —— 查不到就是 undefined（不影响发通知）。
+ * @param scope - 插件上下文。
+ * @param sessionId - 会话 id。
+ * @param session - 事件里带的对象（可能不是 Session）。
+ */
+function liveSessionOf(scope, sessionId, session) {
+  if (session !== null && typeof session === 'object' && session.header !== undefined) return session
+  try {
+    return scope.get('sessions', false)?.get?.(sessionId)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 这条会话是不是子代理（subagent）的。
+ *
+ * 子代理每一次 `agent()` 结束都会走一遍 `turn/end(completed)`，而且一次任务能开出
+ * 几十个。它们**一律不通知**：用户关心的是自己那个会话，不是内部那一群。
+ */
+function isSubagentSession(scope, sessionId, session) {
+  const live = liveSessionOf(scope, sessionId, session)
+  const header = live?.header
+  return header?.origin === 'subagent' || header?.parentSession !== undefined
+}
+
+/** 会话标题（通知正文里那句「《标题》」）；拿不到时 undefined。 */
+function sessionTitleOf(scope, session) {
+  try {
+    const title = scope.get('sessionTitle', false)?.get?.(session)?.title
+    return typeof title === 'string' ? clipText(title) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 审批请求的一句话摘要：优先用给用户看的 reason，其次工具名。 */
+function describeApproval(request) {
+  if (request === null || typeof request !== 'object') return undefined
+  const display = request.displayReason
+  if (display !== null && typeof display === 'object') {
+    const text = clipText(display.zh ?? display.en ?? '')
+    if (text !== undefined) return text
+  }
+  if (typeof request.toolName === 'string' && request.toolName !== '') return clipText(request.toolName)
+  return clipText(request.reason ?? '')
+}
+
+/** 提问请求的一句话摘要：第一道题的题头（没有就用问题本身）。 */
+function describeQuestion(request) {
+  const first = Array.isArray(request?.questions) ? request.questions[0] : undefined
+  if (first !== null && typeof first === 'object') return clipText(first.header ?? first.question ?? '')
+  return undefined
+}
+
+/**
+ * 状态通知的采集器。
+ *
+ * 设计要点：
+ *
+ *  1. **宿主侧判定，客户端只负责弹**。三种状态里只有宿主知道得准：`turn/end` 的
+ *     reason、审批/提问的拦截点、以及子代理会话的存在。让浏览器去猜（例如「看着像
+ *     空闲了」）会漏、会重复，而且手机一锁屏就全错。
+ *  2. **写进一个只在内存里的环形缓冲**，客户端按 `seq` 增量取（见 `notifyPayload`）。
+ *     不写盘、不发系统推送：远程页面本来就要带 cookie 才能进来，多一条推送通道
+ *     等于多一套凭据与配置，而这条通知的价值窗口只有「页面开着但人没看」。
+ *  3. **每个监听器都包在 try/catch 里**。审批 / 提问是 waterfall，我们的监听器
+ *     一抛就会让审批链断掉 —— 通知把用户挡在门外，那是最糟的失败方式。
+ * @param scope - 插件上下文。
+ * @param config - 归一化后的配置。
+ * @param runtime - 活状态（缓冲挂在 `runtime.notify` 上）。
+ */
+function createNotifier(scope, config, runtime) {
+  const dedupe = new Map()
+
+  /** 丢掉过期与超额的旧事件（只影响还没被取走的那部分）。 */
+  function prune(now) {
+    const events = runtime.notify.events
+    while (events.length > 0 && now - events[0].at > NOTIFY_EVENT_TTL_MS) events.shift()
+    while (events.length > NOTIFY_EVENTS_MAX) events.shift()
+  }
+
+  /**
+   * 记一条通知事件。
+   * @param kind - `'done' | 'question' | 'error'`。
+   * @param session - Session 对象、`{ id }` 或会话 id 字符串。
+   * @param detail - 附注（工具名 / 问题摘要 / 错误信息），可省略。
+   * @returns 记进去的那条事件；被丢弃时 undefined。
+   */
+  function record(kind, session, detail) {
+    if (!config.notify) return undefined
+    if (runtime.notifyEnabled !== true) return undefined
+    const sessionId = typeof session === 'string' ? session : session?.id
+    if (typeof sessionId !== 'string' || sessionId === '') return undefined
+    if (isSubagentSession(scope, sessionId, session)) return undefined
+
+    const now = Date.now()
+    const key = `${kind}:${sessionId}`
+    const last = dedupe.get(key)
+    if (last !== undefined && now - last < NOTIFY_DEDUPE_MS) return undefined
+    // 去重表按 `类别:会话` 记账，长期运行会攒下每个见过的会话；超过一个很小的上限就整体
+    // 清空 —— 唯一代价是下一轮可能需要重新去重一次，而它的最坏情况（多弹一条）远小于
+    // 一张只增不减表的最坏情况（进程里慢慢长大）。
+    if (dedupe.size > 512) dedupe.clear()
+    dedupe.set(key, now)
+
+    const live = liveSessionOf(scope, sessionId, session)
+    const event = {
+      seq: runtime.notify.seq + 1,
+      kind,
+      at: now,
+      sessionId,
+      sessionTitle: live === undefined ? undefined : sessionTitleOf(scope, live),
+      detail: detail === undefined ? undefined : clipText(detail),
+    }
+    runtime.notify.seq = event.seq
+    runtime.notify.events.push(event)
+    prune(now)
+    return event
+  }
+
+  /**
+   * 挂上四个监听。
+   *
+   * `session/event` 是**热路径**（每个落盘事件都会过一遍），所以第一句就是拿 type
+   * 比较字符串，别的什么都不做。
+   * @returns 拆除函数。
+   */
+  function attach() {
+    if (!config.notify) return () => {}
+    const offs = []
+    offs.push(
+      scope.on('session/event', (session, event) => {
+        try {
+          if (event?.type !== 'turn/end') return
+          // 继承来的（fork / 恢复出来）事件不是「刚刚发生的事」：它们会成批出现，
+          // 照发就会在 DSH 启动那一刻弹一脸「会话完成」。`isOwnSeq` 是宿主的判据。
+          if (typeof session?.isOwnSeq === 'function' && session.isOwnSeq(event.seq) !== true) return
+          const classified = classifyTurnEnd(event.data?.reason)
+          if (classified === undefined) return
+          record(classified.kind, session, classified.detail)
+        } catch {
+          /* 通知坏了也不能影响会话落盘 */
+        }
+      }),
+    )
+    offs.push(
+      scope.on('api-session/error', (sessionId, message) => {
+        try {
+          record('error', sessionId, message)
+        } catch {
+          /* 同上 */
+        }
+      }),
+    )
+    offs.push(
+      scope.on('approval/request', (request, next) => {
+        try {
+          record('question', request?.agent, describeApproval(request))
+        } catch {
+          /* 审批链绝不能被通知拖垮 */
+        }
+        return next()
+      }),
+    )
+    offs.push(
+      scope.on('user-questions/request', (request, next) => {
+        try {
+          record('question', request?.agent, describeQuestion(request))
+        } catch {
+          /* 同上 */
+        }
+        return next()
+      }),
+    )
+    return () => {
+      for (const off of offs) {
+        try {
+          off()
+        } catch {
+          /* 拆除阶段的失败无所谓 */
+        }
+      }
+    }
+  }
+
+  return { record, attach, prune }
+}
+
+/**
+ * 组装 `feed` 端点的响应。
+ *
+ * 语义刻意做成「游标 + 增量」：
+ *   - **不带 `since`** → 只回游标、不回事件。页面刚打开时不该把历史上那几条重弹一遍。
+ *   - `since` 落后太多（超过 `NOTIFY_EVENTS_MAX * 4`）→ 同样只回游标：手机锁屏一晚上
+ *     回来，把那期间攒下的通知一口气全弹出来是骚扰，不是功能。
+ * @param config - 归一化后的配置。
+ * @param runtime - 活状态。
+ * @param urlRaw - 请求的 URL（用来取 `since`）。
+ */
+function notifyPayload(config, runtime, urlRaw) {
+  const enabled = config.notify && runtime.notifyEnabled === true
+  const cursor = runtime.notify.seq
+  let sinceRaw
+  try {
+    sinceRaw = new URL(String(urlRaw ?? ''), 'http://localhost').searchParams.get('since')
+  } catch {
+    sinceRaw = null
+  }
+  const since = sinceRaw === null || sinceRaw === '' ? Number.NaN : Number.parseInt(sinceRaw, 10)
+  if (!Number.isFinite(since) || since < 0) return { ok: true, notify: enabled, cursor, events: [] }
+  const backlog = cursor - since
+  if (backlog <= 0) return { ok: true, notify: enabled, cursor, events: [] }
+  if (backlog > NOTIFY_EVENTS_MAX * 4) return { ok: true, notify: enabled, cursor, events: [] }
+  const events = runtime.notify.events.filter((event) => event.seq > since).slice(-NOTIFY_EVENTS_MAX)
+  return { ok: true, notify: enabled, cursor, events }
+}
+
+/**
  * 注册管理端点。
  *
  * 即便 `enabled=false` 也注册：设置页那一行要能回答「为什么没起来」，
@@ -1292,6 +1584,61 @@ function registerAdminRoutes(scope, config, runtime, deps = REAL_DEPS) {
       }),
     'tailscale-remote: lite route',
   )
+
+  // 状态通知：远程页面按游标增量取。
+  //
+  // 为什么是轮询、不是 SSE / WebSocket：这条端点在 DSH 的 `/api` 前缀路由上，
+  // handler 拿到的是 `Request → Response`；挂一条长连接既要在 `Response` 的流式体上
+  // 赌压缩中间件不缓冲，又要自己处理重连与鉴权过期。而这里一次往返只有几百字节、
+  // 4 秒一次 —— 用最笨的方式换「一定通、一定好测」。
+  scope.effect(
+    () =>
+      routes.register({
+        path: NOTIFY_FEED_PATH,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: (request) => Promise.resolve(json(notifyPayload(config, runtime, request?.url))),
+      }),
+    'tailscale-remote: notify feed route',
+  )
+
+  // 运行期总开关（「设置 → 通用 → 手机连接」里那个）。
+  //
+  // 关掉时**立刻清空缓冲**：否则重新打开的那一刻，客户端会把关闭期间的旧事件当成
+  // 新事件一股脑弹出来。游标（`seq`）不回收，所以清空不会让客户端把旧编号当成新的。
+  scope.effect(
+    () =>
+      routes.register({
+        path: NOTIFY_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          try {
+            const body = await request.json().catch(() => undefined)
+            const enabled = body?.enabled
+            if (typeof enabled !== 'boolean') {
+              return json({ ok: false, error: '缺少 enabled（布尔值）' }, 400)
+            }
+            if (!config.notify) {
+              return json({ ok: false, error: '配置里 notify=false，这台实例不提供状态通知' }, 409)
+            }
+            runtime.notifyEnabled = enabled
+            if (!enabled) runtime.notify.events.length = 0
+            let persisted = false
+            if (runtime.state !== undefined && typeof deps.persistState === 'function') {
+              const next = { ...runtime.state, notify: enabled, updatedAt: new Date().toISOString() }
+              await deps.persistState(scope, next)
+              runtime.state = next
+              persisted = true
+            }
+            return json({ ok: true, notify: enabled, persisted })
+          } catch (error) {
+            return json({ ok: false, error: String(error?.message ?? error) }, 409)
+          }
+        },
+      }),
+    'tailscale-remote: notify route',
+  )
 }
 
 /**
@@ -1325,6 +1672,18 @@ function freshRuntime(undo) {
     lite: undefined,
     /** `createLiteController` 的产物；桌面端没有 webServer/clientModules 时为 undefined。 */
     liteController: undefined,
+    /**
+     * 状态通知的运行期总开关（设置页那个开关写的就是它）。
+     *
+     * 初值来自 config，`setup` 起来后会从状态文件里读回上一次的选择 —— 但**只有**
+     * 配置没关掉时才认那个值（config 的 `notify: false` 是硬开关，用户不该因为上次
+     * 留了个 true 就又被通知）。
+     */
+    notifyEnabled: true,
+    /** 还没被取走的事件缓冲区 `{ seq, events }`。只在内存里，进程重启即清空。 */
+    notify: { seq: 0, events: [] },
+    /** `createNotifier` 的产物；配置关掉时为 undefined。 */
+    notifier: undefined,
     undo,
   }
 }
@@ -1357,6 +1716,7 @@ export function apply(ctx, rawConfig) {
       disposed: false,
     }
     const runtime = freshRuntime(undo)
+    runtime.notifyEnabled = config.notify
 
     // 管理端点**即便 enabled=false 也注册**：设置页那一行要能回答「为什么没起来」，
     // 而不是只能看到一个 404。客户端半边是独立声明的，禁用时照样会加载并渲染这一行。
@@ -1368,6 +1728,17 @@ export function apply(ctx, rawConfig) {
     }
 
     registerAdminRoutes(scope, config, runtime)
+
+    // 状态通知：采集端不依赖 tailscale / webServer，只要插件启用就挂上。
+    //
+    // 监听器跟着 fiber 走（`scope.effect`），插件卸载就摘掉；采集本身在总开关关掉时
+    // 是空转（`record` 第一句就返回），所以挂着的成本只有四个回调指针。
+    if (config.notify) {
+      const notifier = createNotifier(scope, config, runtime)
+      runtime.notifier = notifier
+      scope.effect(() => notifier.attach(), 'tailscale-remote: notify listeners')
+      ctx.logger.info('tailscale-remote: 状态通知已装配（远程页面开启后才会收到）')
+    }
 
     // 精简模式的装配。
     //
@@ -1426,6 +1797,17 @@ async function setup(scope, config, undo, deps = REAL_DEPS, runtime = freshRunti
   // 精简模式没有「读回上次的选择」这一步：远程端默认永远是精简页，
   // 只有用户按了那个按钮之后的 20 秒窗口里才发完整页（见 FULL_PAGE_GRANT_MS）。
   // 状态文件里遗留的 `lite` 字段因此不再被读、也不再被写。
+  //
+  // 状态通知**要**读回上次的选择（那个开关是持久的）：它记在状态文件的 `notify`
+  // 字段里，和登录密钥同一个文件。读不到（第一次跑、文件坏了）就用 config 的默认值。
+  if (config.notify && typeof deps.loadState === 'function') {
+    try {
+      const previous = await deps.loadState(scope, config)
+      if (typeof previous?.notify === 'boolean') runtime.notifyEnabled = previous.notify
+    } catch {
+      /* 读不回来就用默认值：开着 */
+    }
+  }
 
   const binary = await deps.resolveBinary(scope, config.binaryPath)
   if (binary === undefined) {
@@ -1577,6 +1959,8 @@ async function setup(scope, config, undo, deps = REAL_DEPS, runtime = freshRunti
     target,
     cookieMaxAgeDays: config.cookieMaxAgeDays,
     // 注意这里**没有** `lite` 字段：精简模式不再是「用户的选择」，不再需要跨重启记住。
+    // 状态通知不同 —— 它就是一个用户选择，所以写在这里，下次启动读回来。
+    notify: runtime.notifyEnabled,
     updatedAt: new Date().toISOString(),
     stateFile: config.stateFile,
   }
@@ -1700,4 +2084,16 @@ export const internals = {
   LITE_PATH,
   FULL_PAGE_GRANT_MS,
   AUTH_RECORD_KEY,
+  NOTIFY_FEED_PATH,
+  NOTIFY_PATH,
+  NOTIFY_EVENTS_MAX,
+  NOTIFY_EVENT_TTL_MS,
+  NOTIFY_DEDUPE_MS,
+  classifyTurnEnd,
+  describeApproval,
+  describeQuestion,
+  errorText,
+  clipText,
+  createNotifier,
+  notifyPayload,
 }
