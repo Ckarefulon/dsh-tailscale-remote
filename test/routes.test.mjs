@@ -1026,3 +1026,96 @@ test('WebSocket 压缩的惰性钩子：armOnce 可重复调用，且失败不�
   assert.doesNotThrow(() => { result = armed.armOnce() })
   assert.equal(typeof result, 'boolean')
 })
+// —— 关闭通知时的客户端剪枝（宿主这一侧） ————————————————————————————————
+
+test('通知关闭时：远端拿到的合并请求里没有那段代码；打开时原样带回来', async () => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { composeLiteGraph } = await import('../lite.js')
+
+  const clientSource = await readFile(new URL('../client/client.js', import.meta.url), 'utf8')
+  const dir = await mkdtemp(join(tmpdir(), 'lite-notify-'))
+  const variantOf = (variant) => composeLiteGraph(SAMPLE_GRAPH, { variant })
+  const pathsFor = async (lite) => {
+    const paths = {}
+    for (const id of lite.ids) {
+      const file = join(dir, `${id.replace(/[@/]/g, '_')}.js`)
+      await writeFile(
+        file,
+        id === 'dsh-tailscale-remote' ? clientSource : `register(${JSON.stringify(id)})\n`,
+      )
+      paths[id] = file
+    }
+    return paths
+  }
+
+  /** 按指定变体打一次真实的合并请求，回原文。 */
+  const serve = async (variant) => {
+    const lite = variantOf(variant)
+    const batch = lite.batches.find((b) => b.phase === 'application')
+    const paths = await pathsFor(lite)
+    const scope = liteScope({ graph: SAMPLE_GRAPH, clientPath: paths })
+    const runtime = freshRuntime({})
+    runtime.notifyEnabled = variant === 'notify'
+    createLiteController(scope, LITE_CONFIG, runtime)
+    const route = scope.registered.find((r) => r.path === '/remote-lite-plugins')
+    const sent = { body: undefined, status: undefined }
+    await route.handler(
+      { method: 'GET', url: `/${batch.url}`, headers: {} },
+      { writeHead: (status) => { sent.status = status }, end: (body) => { sent.body = body }, headersSent: false },
+    )
+    assert.equal(sent.status, 200)
+    return sent.body
+  }
+
+  const on = await serve('notify')
+  const off = await serve('plain')
+
+  assert.ok(on.includes('dsh-tailscale-remote-notify'), '开着时铃铛代码要在')
+  assert.ok(on.includes('notify/feed'), '开着时轮询端点要在')
+  assert.equal(off.includes('dsh-tailscale-remote-notify'), false, '关掉时铃铛代码一个字节都不该发')
+  assert.equal(off.includes('notify/feed'), false, '关掉时轮询代码也不该发')
+  // 与通知无关的字节必须原样保留（精简/完整切换按钮、设置行都在）。
+  assert.ok(off.includes("id: 'dsh-tailscale-remote'"))
+  assert.ok(off.includes('LiteSwitch'))
+  // 真的省了字节（约 13 KB 原文）。
+  assert.ok(on.length - off.length > 10000, `只省了 ${on.length - off.length} 字节`)
+
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('通知关闭时的剪枝失败会退回原字节（绝不发语法坏掉的页面）', async () => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { composeLiteGraph } = await import('../lite.js')
+
+  // 一段「标记圈住了但剪完不合法」的源码：begin 之后直接截断成非法结构。
+  const broken = 'window.__ModuleLoader__.load({id:"dsh-tailscale-remote",factory:()=>({/* @notify-client:begin */ if ('
+  const dir = await mkdtemp(join(tmpdir(), 'lite-notify-bad-'))
+  const lite = composeLiteGraph(SAMPLE_GRAPH, { variant: 'plain' })
+  const batch = lite.batches.find((b) => b.phase === 'application')
+  const paths = {}
+  for (const id of lite.ids) {
+    const file = join(dir, `${id.replace(/[@/]/g, '_')}.js`)
+    await writeFile(file, id === 'dsh-tailscale-remote' ? broken : `register(${JSON.stringify(id)})\n`)
+    paths[id] = file
+  }
+
+  const scope = liteScope({ graph: SAMPLE_GRAPH, clientPath: paths })
+  const runtime = freshRuntime({})
+  runtime.notifyEnabled = false
+  createLiteController(scope, LITE_CONFIG, runtime)
+  const route = scope.registered.find((r) => r.path === '/remote-lite-plugins')
+  const sent = { body: undefined, status: undefined }
+  await route.handler(
+    { method: 'GET', url: `/${batch.url}`, headers: {} },
+    { writeHead: (status) => { sent.status = status }, end: (body) => { sent.body = body }, headersSent: false },
+  )
+  assert.equal(sent.status, 200, '剪坏了也不能让请求失败')
+  assert.ok(sent.body.includes('@notify-client:begin'), '剪枝失败时必须原样发未剪的字节')
+  assert.ok(scope.logs.some((line) => line.includes('notify-strip-invalid')), '必须留下日志')
+  await rm(dir, { recursive: true, force: true })
+  void readFile
+})

@@ -305,6 +305,7 @@ window.__ModuleLoader__.load({
 			return { ok: true, data: body }
 		}
 
+		/* @notify-client:begin */
 		// ————————————————————————————————————————————————————————————————
 		// 状态通知（浏览器这一半）
 		//
@@ -516,6 +517,7 @@ window.__ModuleLoader__.load({
 				}
 			},
 		}
+		/* @notify-client:end */
 
 		/** 把文案里的阶段/错误翻成人话；认不出来就把原文附在后面。 */
 		function describePhase(t, state) {
@@ -543,7 +545,6 @@ window.__ModuleLoader__.load({
 			const [copied, setCopied] = useState(false)
 			const [confirming, setConfirming] = useState(false)
 			const [notice, setNotice] = useState(null)
-			const [notifyBusy, setNotifyBusy] = useState(false)
 			const inputRef = useRef(null)
 
 			const t = pickLanguage(ctx) === 'zh' ? ZH : EN
@@ -626,31 +627,6 @@ window.__ModuleLoader__.load({
 			}, [t])
 
 			const canRotate = state !== null && state.canRotate === true && !busy
-
-			/**
-			 * 状态通知的总开关。
-			 *
-			 * 它是**总闸**：关掉之后任何远程页面都收不到通知（宿主那头连状态都不采集）。
-			 * 「哪台设备收」是第二层，在各自的远程页面上用侧边栏那个铃铛决定 —— 这样
-			 * 不用在宿主这边维护一张设备表（那需要设备标识、注册、过期清理，而收益只有
-			 * 「少点一下」）。
-			 */
-			const toggleNotify = useCallback(async () => {
-				if (state === null || notifyBusy) return
-				setNotifyBusy(true)
-				const result = await readJson(NOTIFY_PATH, {
-					method: 'POST',
-					headers: { 'content-type': 'application/json' },
-					body: JSON.stringify({ enabled: state.notify !== true }),
-				})
-				setNotifyBusy(false)
-				if (!result.ok) {
-					setNotice(`${t.notifyFailed}：${result.error}`)
-					return
-				}
-				setNotice(null)
-				setState((previous) => ({ ...(previous ?? {}), notify: result.data.notify === true }))
-			}, [state, notifyBusy, t])
 
 			// 文案必须跟着实际行为走：吊销会话时警告要说清「所有设备都会退出」，
 			// 否则用户以为只是换个链接，结果手机被踢下线、还不知道为什么。
@@ -745,31 +721,19 @@ window.__ModuleLoader__.load({
 						copied ? t.copied : t.copy,
 					),
 				),
-				state === null || state.notifyAvailable !== true
+				// 状态通知总开关。组件本身住在 `@notify-client` 那一段里（总闸关掉时
+				// 那段代码不会被发给远程页面），所以这里同样要用 `typeof` 判存在性。
+				state === null || state.notifyAvailable !== true || typeof NotifyRowSwitch !== 'function'
 					? null
-					: h(
-							'div',
-							{ style: styles.notifyRow, 'data-dsh-tailscale-remote-notify-row': '' },
-							h(
-								'div',
-								{ style: styles.notifyText },
-								h('span', { style: styles.label }, t.notifyTitle),
-								h('div', { style: styles.notifyHint }, t.notifyRowHint(state.notify === true)),
-							),
-							h(
-								'button',
-								{
-									type: 'button',
-									role: 'switch',
-									'aria-checked': state.notify === true,
-									'data-dsh-tailscale-remote-notify': state.notify === true ? 'on' : 'off',
-									style: { ...styles.button, ...(state.notify === true ? styles.buttonOn : {}) },
-									disabled: notifyBusy,
-									onClick: () => void toggleNotify(),
-								},
-								state.notify === true ? t.notifySwitchOn : t.notifySwitchOff,
-							),
-						),
+					: h(NotifyRowSwitch, {
+							enabled: state.notify === true,
+							t,
+							onChanged: (next) => {
+								setNotice(null)
+								setState((previous) => ({ ...(previous ?? {}), notify: next }))
+							},
+							onFailed: (message) => setNotice(message),
+						}),
 				confirming ? h('div', { style: styles.warn }, warningText) : null,
 				notice === null ? null : h('div', { style: styles.warn }, notice),
 				error !== null
@@ -1033,6 +997,64 @@ window.__ModuleLoader__.load({
 				h(LiteSwitchIcon, { size: 16, strokeWidth: 1 }),
 			)
 		}
+		/* @notify-client:begin */
+		/**
+		 * 设置行里那个「状态通知」总开关。
+		 *
+		 * 为什么单独拆成一个组件、而不是写在 `RemoteRow` 的渲染树里：总闸关掉时，宿主播给
+		 * 远端的 bundle 里这一段会被**整段剪掉**（见 lite.js 的 `stripNotifyClient`），
+		 * 设置行那边用 `typeof NotifyRowSwitch` 判存在性。写在行里就剪不掉了（剪一半会让
+		 * 那个三元表达式引用到不存在的东西）。
+		 *
+		 * 它只出现在桌面窗口与完整页面上：精简页面上没有「设置 → 通用」那个插槽。
+		 * @param props - `{ enabled, t, onChanged, onFailed }`。
+		 */
+		function NotifyRowSwitch(props) {
+			const [busy, setBusy] = useState(false)
+			const t = props.t
+			const enabled = props.enabled === true
+
+			const toggle = useCallback(async () => {
+				if (busy) return
+				setBusy(true)
+				const result = await readJson(NOTIFY_PATH, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ enabled: !enabled }),
+				})
+				setBusy(false)
+				if (!result.ok) {
+					if (typeof props.onFailed === 'function') props.onFailed(`${t.notifyFailed}：${result.error}`)
+					return
+				}
+				if (typeof props.onChanged === 'function') props.onChanged(result.data.notify === true)
+			}, [busy, enabled, t])
+
+			return h(
+				'div',
+				{ style: styles.notifyRow, 'data-dsh-tailscale-remote-notify-row': '' },
+				h(
+					'div',
+					{ style: styles.notifyText },
+					h('span', { style: styles.label }, t.notifyTitle),
+					h('div', { style: styles.notifyHint }, t.notifyRowHint(enabled)),
+				),
+				h(
+					'button',
+					{
+						type: 'button',
+						role: 'switch',
+						'aria-checked': enabled,
+						'data-dsh-tailscale-remote-notify': enabled ? 'on' : 'off',
+						style: { ...styles.button, ...(enabled ? styles.buttonOn : {}) },
+						disabled: busy,
+						onClick: () => void toggle(),
+					},
+					enabled ? t.notifySwitchOn : t.notifySwitchOff,
+				),
+			)
+		}
+
 		/** 铃铛图标（16×16，DSH 图标规范）。关着的时候多一道斜杠。 */
 		function NotifyBellIcon(props) {
 			const size = props?.size ?? 16
@@ -1171,6 +1193,7 @@ window.__ModuleLoader__.load({
 				h(NotifyBellIcon, { size: 16, strokeWidth: 1, on }),
 			)
 		}
+		/* @notify-client:end */
 
 		/**
 		 * 注册这个插件的两处界面。
@@ -1229,6 +1252,12 @@ window.__ModuleLoader__.load({
 			)
 
 			// 状态通知的铃铛：同一格的第二个座位（id 必须不同，否则会顶掉切换按钮）。
+			//
+			// 总闸关掉时，宿主**不会把上面那段通知代码发给远程页面**（见 lite.js 的
+			// `stripNotifyClient`）。所以这里必须用 `typeof` 判存在性：那一段被剪掉后
+			// `NotifySwitch` 是个未声明的标识符，`typeof` 对它返回 'undefined' 而**不抛**，
+			// 于是这一格自然不注册、整包照常启动。少了这层判断，剪枝就等于给手机发一片白屏。
+			if (typeof NotifySwitch !== 'function') return
 			ctx.slots.inject('sidebar.footer.action', () =>
 				ctx.slots.register(
 					{

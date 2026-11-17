@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { internals } from '../index.js'
+import { stripNotifyClient } from '../lite.js'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 // 按 manifest 导出的那个确切路径读，这样发布布局一旦漂移，这个测试也会红。
@@ -185,7 +186,7 @@ function loadBundle(overrides = {}) {
           calls.push({ path, options })
           return overrides.fetch(path, options)
         }
-  const run = new Function('window', 'document', 'navigator', 'globalThis', 'fetch', bundle)
+  const run = new Function('window', 'document', 'navigator', 'globalThis', 'fetch', overrides.source ?? bundle)
   run(
     window,
     document,
@@ -1078,6 +1079,33 @@ describe('状态通知（浏览器这一半）', () => {
     return out
   }
 
+  it('总闸关掉时客户端代码整段不发给远端：剪过的包照样能加载，只是没有铃铛', async () => {
+    // 这是 lite.js 那条剪枝在**客户端这一侧**的对应断言：宿主剪在字节上，但剪过的包
+    // 必须仍然是一个能跑起来的 bundle（否则远端白屏，用户没有任何自救手段）。
+    const stripped = stripNotifyClient(bundle)
+    const { registrations, exports } = loadBundle({ source: stripped })
+    assert.equal(typeof exports.apply, 'function')
+    assert.doesNotThrow(() => exports.apply(loadBundle({ source: stripped }).ctx))
+
+    const env = loadBundle({ source: stripped })
+    env.exports.apply(env.ctx)
+    const injects = env.registrations.filter((r) => r.kind === 'slots.inject')
+    // 设置行 + 精简/完整切换按钮：与通知无关的两个座位照旧。
+    assert.equal(injects.length, 2, `剪过后只该剩两处注册，实际 ${injects.length}`)
+    assert.deepEqual(injects.map((r) => r.name).sort(), ['settings.general.item', 'sidebar.footer.action'])
+    // 铃铛那一格绝不能注册（它的组件已经被剪掉了）。
+    for (const inject of injects) {
+      inject.register()
+      const registered = env.registrations.filter((r) => r.kind === 'slots.register')
+      assert.equal(
+        registered.some((r) => r.definition.id === 'dsh-tailscale-remote-notify'),
+        false,
+        '剪过的包里不该再注册通知铃铛',
+      )
+    }
+    void registrations
+  })
+
   it('宿主没开这个功能时不占那一格', async () => {
     const env = browserEnv()
     const { tree } = await renderBell({
@@ -1226,28 +1254,33 @@ describe('状态通知（浏览器这一半）', () => {
     assert.equal(env.notes.shown.length, 0)
   })
 
-  it('设置页那一行里的总开关：点一下真的 POST，并跟着改文案', async () => {
-    const { tree, renderer, registration, props, calls } = await renderRow({
-      locale: ZH_LOCALE,
-      fetch: notifyFetch({ state: { notify: true } }),
-    })
-    const toggle = findBy(tree, (node) => node.type === 'button' && node.props.role === 'switch')
-    assert.ok(toggle !== undefined, '设置页里必须有那个总开关')
+  it('设置页那一行里的总开关：点一下真的 POST，并跟着 enabled 改文案', async () => {
+    const { tree, calls } = await renderRow({ locale: ZH_LOCALE, fetch: notifyFetch({ state: { notify: true } }) })
+    // 开关本身是个子组件（拆出来是为了「总闸关掉时整段剪掉」），父行只负责传状态。
+    const holder = findBy(tree, (node) => typeof node.type === 'function' && node.props?.enabled !== undefined)
+    assert.ok(holder !== undefined, '设置页里必须有那个总开关')
+    assert.equal(holder.props.enabled, true)
+
+    // 单独用一个新的迷你渲染器渲染它：父行那个渲染器的 hook 槽位是按「一次只渲染一个
+    // 组件」设计的，混着渲染父子两代会把槽位串味。
+    const childRenderer = createRenderer()
+    const switchTree = childRenderer.render(holder.type, holder.props)
+    const toggle = findBy(switchTree, (node) => node.type === 'button' && node.props.role === 'switch')
     assert.equal(toggle.props['aria-checked'], true)
     assert.equal(stringsOf(toggle).join(''), '已开启')
 
     toggle.props.onClick()
-    await renderer.flush()
+    await childRenderer.flush()
 
     const posted = calls.find((call) => call.path === SWITCH_ENDPOINT)
     assert.ok(posted !== undefined, '必须真的打到总开关端点')
     assert.equal(posted.options.method, 'POST')
     assert.deepEqual(JSON.parse(posted.options.body), { enabled: false })
 
-    const after = renderer.render(registration.component, props)
-    await renderer.flush()
-    const switched = findBy(after, (node) => node.type === 'button' && node.props.role === 'switch')
-    assert.equal(switched.props['aria-checked'], false)
-    assert.equal(stringsOf(switched).join(''), '已关闭')
+    // 文案跟着传进来的 enabled 走（父行 setState 之后就是传 false 进来）。
+    const off = childRenderer.render(holder.type, { ...holder.props, enabled: false })
+    const offToggle = findBy(off, (node) => node.type === 'button' && node.props.role === 'switch')
+    assert.equal(offToggle.props['aria-checked'], false)
+    assert.equal(stringsOf(offToggle).join(''), '已关闭')
   })
 })

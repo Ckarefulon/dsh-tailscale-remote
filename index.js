@@ -30,7 +30,18 @@ import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { LITE_HIDE, LITE_ROUTE, composeComboBody, composeLiteGraph, encodeComboBody, matchLiteRequest, rewriteIndex } from './lite.js'
+import {
+  LITE_HIDE,
+  LITE_ROUTE,
+  NOTIFY_CLIENT_MARKER,
+  composeComboBody,
+  composeLiteGraph,
+  encodeComboBody,
+  matchLiteRequest,
+  rewriteIndex,
+  stripClientSuffix,
+  stripNotifyClient,
+} from './lite.js'
 
 /** 稳定插件名。 */
 export const name = 'dsh-tailscale-remote'
@@ -670,10 +681,43 @@ function createLiteController(scope, config, runtime) {
   }
 
   const logger = scope.logger
-  /** 内核字节缓存：包名 → Buffer。合并请求每次都会重新拼，但读盘只读一次。 */
+  /** 内核字节缓存：`包名|变体` → `{ stamp, bytes }`。合并请求每次都会重新拼，但读盘只读一次。 */
   const bundleCache = new Map()
   /** 压好的合并正文缓存：`包名+rev+编码` → `{ body, encoding, rawBytes }`。 */
   const comboCache = new Map()
+
+  /**
+   * 这一份精简页面发**哪个变体**。
+   *
+   * `'notify'` = 带上状态通知那段客户端代码；`'plain'` = 剪掉它。
+   * 用户的要求是「通知关掉就别把那部分代码传到远端」，所以这个变体一路要传到
+   * `composeLiteGraph` 的 rev 里（否则浏览器会拿缓存里另一份字节）。
+   * @returns `'notify'` 或 `'plain'`。
+   */
+  const notifyVariant = () => (config.notify !== false && runtime.notifyEnabled === true ? 'notify' : 'plain')
+
+  /**
+   * 剪掉状态通知那段客户端代码。
+   *
+   * 三道保险：源码里没有标记就原样返回；剪完先 `new Function` **编译**一次（只编译
+   * 不执行）确认还是合法 JS；编译不过就退回原字节并记一次日志。宁可多发那几百字节的
+   * 死代码，也绝不发一个语法坏掉的页面 —— 远端用户没有任何自救手段。
+   * @param raw - `client.js` 的原始字节。
+   * @returns 要发给远端的字节。
+   */
+  const trimNotifyClient = (raw) => {
+    const source = raw.toString('utf8')
+    if (!source.includes(NOTIFY_CLIENT_MARKER)) return raw
+    const stripped = stripNotifyClient(source)
+    try {
+      // 只做语法检查，不执行：客户端 bundle 顶层会碰 window，执行会炸。
+      new Function(stripped)
+    } catch {
+      warnLiteUnavailable('notify-strip-invalid')
+      return raw
+    }
+    return Buffer.from(stripped, 'utf8')
+  }
 
   /**
    * 用**当前**的整图重算一次精简图。
@@ -686,6 +730,7 @@ function createLiteController(scope, config, runtime) {
     const full = clientModules.graph()
     return composeLiteGraph(full, {
       ...(config.liteSeeds === undefined ? {} : { seeds: config.liteSeeds }),
+      variant: notifyVariant(),
     })
   }
 
@@ -700,6 +745,9 @@ function createLiteController(scope, config, runtime) {
   const readBundle = async (id) => {
     const path = clientModules.clientPath(id)
     if (typeof path !== 'string') return undefined
+    const variant = notifyVariant()
+    // 缓存键带变体：同一份文件在「发通知代码 / 不发」两种形态下字节不同。
+    const key = `${id}|${variant}`
     let stamp
     try {
       const info = await stat(path)
@@ -707,11 +755,12 @@ function createLiteController(scope, config, runtime) {
     } catch {
       return undefined
     }
-    const cached = bundleCache.get(id)
+    const cached = bundleCache.get(key)
     if (cached !== undefined && cached.stamp === stamp) return cached.bytes
     try {
-      const bytes = await readFile(path)
-      bundleCache.set(id, { stamp, bytes })
+      const raw = await readFile(path)
+      const bytes = variant === 'plain' && stripClientSuffix(id) === name ? trimNotifyClient(raw) : raw
+      bundleCache.set(key, { stamp, bytes })
       return bytes
     } catch {
       return undefined

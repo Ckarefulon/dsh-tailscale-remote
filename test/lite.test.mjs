@@ -5,6 +5,7 @@
 // 「正常路径真的裁掉了东西」，也要验「任何一个前置条件不满足时都原样发完整页面」。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import {
   LITE_HIDE,
@@ -12,12 +13,14 @@ import {
   LITE_REQUIRED,
   LITE_ROUTE,
   LITE_SEEDS,
+  NOTIFY_CLIENT_MARKER,
   composeComboBody,
   composeLiteGraph,
   encodeComboBody,
   matchLiteRequest,
   rewriteIndex,
   stripClientSuffix,
+  stripNotifyClient,
 } from '../lite.js'
 
 /** 造一个够真的插件图：id/url/rev 齐备，可以带 inject 与 external 边。 */
@@ -441,4 +444,57 @@ test('Agent 预设选择器在种子里（新建会话首页上选「标准 / PT
   assert.ok(LITE_SEEDS.includes('@deepseek-ai/dsh-client-ui-agent-preset'), '预设选择器要在种子里')
   // 依赖它的那个插槽的声明方也必须在，否则注册进去也没人渲染。
   assert.ok(LITE_SEEDS.includes('@deepseek-ai/dsh-client-ui-conversation'), 'ui-conversation 必须留')
+})
+// —— 关闭通知时的客户端剪枝 ——————————————————————————————————————————————
+//
+// 用户的要求是「通知关了就别把那部分代码传到远端」。这里盯三件事：
+//   1. 那段代码真的能整段剪掉，且**剪完仍是合法 JS**（剪坏了 = 手机白屏，没有自救手段）；
+//   2. 剪完留着的守卫还在（`typeof NotifySwitch` 那条判断，缺它就是 ReferenceError）；
+//   3. 剪过的版本换了 rev（合并请求是 immutable 一年缓存，共用 URL 会让铃铛永远消失）。
+
+test('关闭通知时：客户端那段代码能整段剪掉，剪完仍然合法', () => {
+  const source = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
+  // 源码里必须真的圈了两段（轮询器一段、两个组件一段），否则下面的断言会空转。
+  assert.equal(source.split(NOTIFY_CLIENT_MARKER).length - 1, 2, 'client.js 里必须有两处标记')
+
+  const stripped = stripNotifyClient(source)
+  assert.equal(stripped.includes(NOTIFY_CLIENT_MARKER), false, '标记行要一起剪掉')
+  assert.equal(stripped.includes('function NotifySwitch'), false, '铃铛组件要剪掉')
+  assert.equal(stripped.includes('notify/feed'), false, '轮询端点也要一起剪掉')
+  assert.equal(stripped.includes('dsh-tailscale-remote.notify'), false, 'localStorage 键也要剪掉')
+
+  // 与通知无关的东西必须原样留着。
+  assert.ok(stripped.includes("id: 'dsh-tailscale-remote'"), '包 id 要留着（外壳按它索引）')
+  assert.ok(stripped.includes('function LiteSwitch'), '精简/完整切换按钮不属于通知，必须留着')
+
+  // 关键：剪完还是合法 JS。只编译不执行（bundle 顶层会碰 window）。
+  assert.doesNotThrow(() => new Function(stripped), '剪完必须仍然能编译，否则远端白屏')
+
+  // 真剪掉了实打实的字节，不是只删两行注释。
+  assert.ok(
+    Buffer.byteLength(source) - Buffer.byteLength(stripped) > 10000,
+    `只剪掉了 ${Buffer.byteLength(source) - Buffer.byteLength(stripped)} 字节，区域标记可能没圈全`,
+  )
+})
+
+test('剪枝留了守卫：`typeof NotifySwitch` 那条判断必须在，否则剪完就是 ReferenceError', () => {
+  const source = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
+  const stripped = stripNotifyClient(source)
+  assert.ok(stripped.includes("typeof NotifySwitch !== 'function'"), '注册点上必须有存在性守卫')
+})
+
+test('页面变体进 rev：剪过的版本不能和带通知的版本共用 URL（immutable 缓存）', () => {
+  const full = sampleGraph()
+  const withNotify = composeLiteGraph(full)
+  const plain = composeLiteGraph(full, { variant: 'plain' })
+  assert.ok(withNotify !== undefined && plain !== undefined)
+
+  // 包集合必须一模一样：剪的是**字节**，不是把整个包从图里拿掉。
+  assert.deepEqual(withNotify.ids, plain.ids)
+
+  const urlOf = (lite) => lite.batches.filter((batch) => batch.phase === 'application').map((batch) => batch.url).join('|')
+  assert.notEqual(urlOf(withNotify), urlOf(plain), '变体不同就必须换 URL')
+
+  // 默认（不传 variant）与「带通知」完全一致：常见情形不白换一次缓存。
+  assert.equal(urlOf(composeLiteGraph(full)), urlOf(withNotify))
 })

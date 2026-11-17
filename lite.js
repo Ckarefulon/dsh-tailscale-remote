@@ -217,6 +217,33 @@ export function stripClientSuffix(id) {
   return id.endsWith('/client') ? id.slice(0, -7) : id
 }
 
+/**
+ * 客户端 bundle 里「只与状态通知有关」的那两段（由 `client/client.js` 自己打标记圈出）。
+ *
+ * 为什么用标记而不是按函数名挑：剪枝必须**整段**进行 —— 常量、辅助函数、轮询器、
+ * 两个组件、以及它们的调用点，一个都不能漏。按名字挑会在下次改动时悄悄漏掉一部分，
+ * 而漏掉的后果是远端页面 `ReferenceError`（白屏），手机上没有任何自救手段。
+ */
+const NOTIFY_CLIENT_PATTERN = /[ \t]*\/\* @notify-client:begin \*\/[\s\S]*?\/\* @notify-client:end \*\/[ \t]*\r?\n?/g
+
+/** 标记字符串本身（测试用它断言「源码里真的圈了区域」）。 */
+export const NOTIFY_CLIENT_MARKER = '@notify-client:begin'
+
+/**
+ * 把状态通知那段客户端代码从 bundle 源码里剪掉。
+ *
+ * 什么时候用：**通知总闸关着**的时候。用户的要求是「关了就别把那部分代码传到远端」，
+ * 而这两段在关掉时是纯死代码（`apply` 里那个注册点有 `typeof NotifySwitch` 守卫，
+ * 剪掉后它自然不注册）。剪完必须仍然能编译 —— 调用方会用 `new Function` 验一次，
+ * 验不过就退回未剪的字节（宁可多发几百字节，也绝不发一个语法坏掉的页面）。
+ * @param source - `client/client.js` 的源码。
+ * @returns 剪好的源码（标记行一并去掉）。
+ */
+export function stripNotifyClient(source) {
+  if (typeof source !== 'string') return source
+  return source.replace(NOTIFY_CLIENT_PATTERN, '')
+}
+
 /** 按 client-modules 的 framed-hash 口径算 12 位十六进制摘要（换版本 → 换 rev → 换缓存）。 */
 function framedHash(parts) {
   const hash = createHash('sha1')
@@ -270,6 +297,14 @@ export function composeLiteGraph(graph, options = {}) {
   const seeds = options.seeds ?? LITE_SEEDS
   const required = options.required ?? LITE_REQUIRED
   const version = options.version ?? LITE_VERSION
+  /**
+   * 页面变体：状态通知那段客户端代码**发不发**。
+   *
+   * 它必须进 rev 的哈希输入：那条合并请求带 `immutable` 一年缓存，变体不同却共用一个
+   * URL 的话，切回「开通知」后浏览器还用缓存里那份剪过的字节（铃铛消失、且不会自愈）。
+   * 默认 `'notify'` 让「开着」这个常见情形沿用原来的 rev，不白换一次缓存。
+   */
+  const variant = options.variant ?? 'notify'
   if (graph === null || typeof graph !== 'object') return undefined
   if (!Array.isArray(graph.entries) || !Array.isArray(graph.batches)) return undefined
 
@@ -324,6 +359,7 @@ export function composeLiteGraph(graph, options = {}) {
     const rev = framedHash([
       'dsh-tailscale-remote-lite',
       String(version),
+      ...(variant === 'notify' ? [] : [variant]),
       ...chunk.flatMap((id) => [id, byId.get(id).rev]),
     ])
     batches.push({
